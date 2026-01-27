@@ -43,3 +43,7 @@ venv.bak/
 rf-detr-medium.pth
 output/
 runs/
+
+# Data & Logs
+captures/
+traffic_data.db
