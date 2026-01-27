@@ -65,7 +65,7 @@ class DatabaseManager:
             c.execute('''
                 INSERT INTO traffic_events (timestamp, class_name, speed_kmh, direction_deg, image_path, video_source)
                 VALUES (?, ?, ?, ?, ?, ?)
-            ''', (timestamp, class_name, speed, direction, file_path, video_source))
+            ''', (timestamp, class_name, float(speed), float(direction), file_path, video_source))
             conn.commit()
             conn.close()
             
@@ -73,3 +73,97 @@ class DatabaseManager:
             
         except Exception as e:
             logger.error(f"Failed to log event: {e}")
+
+    def get_events(self, limit=100, offset=0):
+        """
+        Retrieve events from DB.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute('''
+                SELECT * FROM traffic_events 
+                ORDER BY timestamp DESC 
+                LIMIT ? OFFSET ?
+            ''', (limit, offset))
+            rows = c.fetchall()
+            conn.close()
+            
+            # Safe conversion to handle potential bytes/encoding issues
+            results = []
+            for row in rows:
+                row_dict = dict(row)
+                safe_dict = {}
+                for k, v in row_dict.items():
+                    if isinstance(v, bytes):
+                        try:
+                            safe_dict[k] = v.decode('utf-8')
+                        except UnicodeDecodeError:
+                            safe_dict[k] = v.decode('utf-8', errors='replace')
+                            logger.warning(f"Field {k} contained bytes that failed to decode utf-8. Replaced.")
+                    else:
+                        safe_dict[k] = v
+                results.append(safe_dict)
+                
+            return results
+        except Exception as e:
+            logger.error(f"Failed to get events: {e}")
+            return []
+
+    def delete_event(self, event_id):
+        """
+        Delete a specific event and its image.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            
+            # Get image path first
+            c.execute('SELECT image_path FROM traffic_events WHERE id = ?', (event_id,))
+            row = c.fetchone()
+            
+            if row:
+                image_path = row['image_path']
+                if image_path and os.path.exists(image_path):
+                    try:
+                        os.remove(image_path)
+                    except OSError as err:
+                        logger.warning(f"Failed to remove file {image_path}: {err}")
+
+                c.execute('DELETE FROM traffic_events WHERE id = ?', (event_id,))
+                conn.commit()
+                return True
+            
+            conn.close()
+            return False
+        except Exception as e:
+            logger.error(f"Failed to delete event {event_id}: {e}")
+            return False
+
+    def delete_all_events(self):
+        """
+        Clear all events and delete all capture files.
+        """
+        try:
+            conn = sqlite3.connect(self.db_path)
+            c = conn.cursor()
+            c.execute('DELETE FROM traffic_events')
+            conn.commit()
+            conn.close()
+            
+            # Delete all files in captures directory
+            if os.path.exists(self.captures_dir):
+                for filename in os.listdir(self.captures_dir):
+                    file_path = os.path.join(self.captures_dir, filename)
+                    try:
+                        if os.path.isfile(file_path):
+                            os.unlink(file_path)
+                    except Exception as e:
+                        logger.warning(f"Failed to delete {file_path}: {e}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"Failed to delete all events: {e}")
+            return False

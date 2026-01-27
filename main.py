@@ -279,5 +279,35 @@ async def config_lines(request: Request):
                  
     return {"status": "updated"}
 
+# --- Event Management Endpoints ---
+@app.get("/api/events")
+async def get_events(limit: int = 100, offset: int = 0):
+    db = DatabaseManager()
+    events = db.get_events(limit, offset)
+    # Add captures url prefix if needed, or serve captures statically
+    # Currently captures are just files. We need to serve them.
+    return {"events": events}
+
+@app.delete("/api/events/{event_id}")
+async def delete_event(event_id: int):
+    db = DatabaseManager()
+    success = db.delete_event(event_id)
+    if success:
+        return {"status": "deleted", "id": event_id}
+    return JSONResponse(status_code=404, content={"message": "Event not found"})
+
+@app.delete("/api/events")
+async def delete_all_events():
+    db = DatabaseManager()
+    success = db.delete_all_events()
+    if success:
+        return {"status": "cleared"}
+    return JSONResponse(status_code=500, content={"message": "Failed to clear events"})
+
+# Mount captures directory to serve images
+if not os.path.exists(os.path.join(ROOT_DIR, "captures")):
+    os.makedirs(os.path.join(ROOT_DIR, "captures"))
+app.mount("/captures", StaticFiles(directory=os.path.join(ROOT_DIR, "captures")), name="captures")
+
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
