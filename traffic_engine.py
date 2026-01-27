@@ -46,21 +46,65 @@ class ObjectTracker:
         """
         return self.tracker.update_with_detections(detections)
 
-class SpeedEstimator:
+class LineSpeedEstimator:
     """
-    Estimates speed based on pixel displacement over time.
-    Note: Without camera calibration, this is purely "pixels per frame" or relative speed.
+    Estimates speed by detecting when objects cross two defined lines.
+    Speed = Distance / TimeDelta.
     """
-    def __init__(self, buffer_size: int = 5):
-        # Tracker ID -> Deque of (x, y) centroids
-        self.positions: Dict[int, Deque] = {}
-        self.speeds: Dict[int, float] = {}
-        self.buffer_size = buffer_size
+    def __init__(self):
+        # Line A and Line B: each is [(x1,y1), (x2, y2)] (Normalized 0-1 if passed that way, but we usually convert later. 
+        # For simplicity, we assume we receive absolute pixel coords or normalized. Let's assume normalized for config.)
+        self.line1 = None
+        self.line2 = None
+        self.real_distance = 5.0 # meters
+        
+        # Tracker State
+        # {tracker_id: { 'start_time': float, 'last_pos': (x,y) }}
+        self.entry_times: Dict[int, float] = {}
+        self.completed_speeds: Dict[int, Dict] = {} # {id: {speed: X, direction: Y}}
+        
+        # Store last known positions for crossing detection
+        self.last_positions: Dict[int, tuple] = {}
 
-    def update(self, detections: sv.Detections):
+    def set_config(self, line1: List[float], line2: List[float], distance: float):
         """
-        Update speed estimates for tracked objects.
+        lines as [x1, y1, x2, y2]
         """
+        self.line1 = line1
+        self.line2 = line2
+        self.real_distance = distance
+        print(f"Speed Config Updated: Dist={distance}m")
+
+    def _ccw(self, A, B, C):
+        return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+
+    def _intersect(self, A, B, C, D):
+        """
+        Return true if line segments AB and CD intersect
+        """
+        return self._ccw(A,C,D) != self._ccw(B,C,D) and self._ccw(A,B,C) != self._ccw(A,B,D)
+
+    def update(self, detections: sv.Detections, frame_shape):
+        """
+        Update speed estimates.
+        """
+        if self.line1 is None or self.line2 is None:
+            return
+
+        import time
+        height, width = frame_shape[:2]
+        current_time = time.time()
+        
+        # Convert normalized lines to pixels
+        l1 = [
+            (self.line1[0]*width, self.line1[1]*height),
+            (self.line1[2]*width, self.line1[3]*height)
+        ]
+        l2 = [
+            (self.line2[0]*width, self.line2[1]*height),
+            (self.line2[2]*width, self.line2[3]*height)
+        ]
+
         if detections.tracker_id is None:
             return
 
@@ -69,29 +113,61 @@ class SpeedEstimator:
         for tracker_id, box in zip(detections.tracker_id, detections.xyxy):
             current_ids.add(tracker_id)
             
-            # Calculate centroid
+            # Centroid
             x_center = (box[0] + box[2]) / 2
             y_center = (box[1] + box[3]) / 2
+            curr_pos = (x_center, y_center)
             
-            if tracker_id not in self.positions:
-                self.positions[tracker_id] = deque(maxlen=self.buffer_size)
-                self.speeds[tracker_id] = 0.0
-            
-            self.positions[tracker_id].append((x_center, y_center))
-            
-            # Calculate speed if we have enough history
-            if len(self.positions[tracker_id]) >= 2:
-                # Euclidean distance between last two points
-                prev_x, prev_y = self.positions[tracker_id][-2]
-                dist = np.sqrt((x_center - prev_x)**2 + (y_center - prev_y)**2)
-                # Simple smoothing
-                self.speeds[tracker_id] = dist  # Units: Pixels/Frame
+            if tracker_id in self.last_positions:
+                prev_pos = self.last_positions[tracker_id]
+                
+                # Check crossing Line 1 (Start)
+                if tracker_id not in self.entry_times:
+                    if self._intersect(prev_pos, curr_pos, l1[0], l1[1]):
+                        self.entry_times[tracker_id] = current_time
+                        # print(f"Object {tracker_id} crossed Line 1 at {current_time}")
 
-        # Cleanup old IDs
-        for tid in list(self.positions.keys()):
-            if tid not in current_ids:
-                del self.positions[tid]
-                del self.speeds[tid]
+                # Check crossing Line 2 (End)
+                if tracker_id in self.entry_times:
+                     if self._intersect(prev_pos, curr_pos, l2[0], l2[1]):
+                        start_time = self.entry_times[tracker_id]
+                        time_diff = current_time - start_time
+                        
+                        if time_diff > 0.1: # Eliminate instant/noise crossings
+                            speed_mps = self.real_distance / time_diff
+                            speed_kmh = speed_mps * 3.6
+                            
+                            # Calculate Direction (Angle) from Start Line to End Line
+                            # Vector from entry line center to current
+                            dx = curr_pos[0] - prev_pos[0]
+                            dy = curr_pos[1] - prev_pos[1]
+                            angle = np.degrees(np.arctan2(dy, dx))
+                            if angle < 0: angle += 360
+                            
+                            self.completed_speeds[tracker_id] = {
+                                "speed": speed_kmh,
+                                "direction": angle,
+                                "timestamp": current_time
+                            }
+                            # print(f"Object {tracker_id} Finished! Speed: {speed_kmh:.2f} km/h")
+                            
+                            # Log to DB/Callback could happen here
+                            
+                            # Remove from entry times to prevent double counting
+                            del self.entry_times[tracker_id]
+
+            self.last_positions[tracker_id] = curr_pos
+
+        # Cleanup
+        # Remove old IDs
+        # Keep completed speeds for display? Or clear after some time?
+        # For now, keep them in 'completed_speeds' but maybe limit size
+        
+        missing_ids = set(self.last_positions.keys()) - current_ids
+        for mid in missing_ids:
+            del self.last_positions[mid]
+            if mid in self.entry_times:
+                del self.entry_times[mid] # Object left before finishing
 
 class StatsManager:
     """
@@ -141,12 +217,28 @@ class TrafficVisualizer:
         self.label_annotator = sv.LabelAnnotator()
         self.trace_annotator = sv.TraceAnnotator()
 
-    def annotate(self, frame: np.ndarray, detections: sv.Detections, stats: StatsManager, speed_estimator: SpeedEstimator = None) -> np.ndarray:
+    def annotate(self, frame: np.ndarray, detections: sv.Detections, stats: StatsManager, speed_estimator: 'LineSpeedEstimator' = None) -> np.ndarray:
         """
         Draw boxes, labels, traces, stats, and speed.
         """
         annotated_frame = frame.copy()
 
+        # Draw Configured Lines if they exist
+        if speed_estimator and speed_estimator.line1 and speed_estimator.line2:
+             height, width = frame.shape[:2]
+             
+             # Draw Line 1 (Green)
+             l1_start = (int(speed_estimator.line1[0]*width), int(speed_estimator.line1[1]*height))
+             l1_end = (int(speed_estimator.line1[2]*width), int(speed_estimator.line1[3]*height))
+             cv2.line(annotated_frame, l1_start, l1_end, (0, 255, 0), 2)
+             cv2.putText(annotated_frame, "START", l1_start, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+             # Draw Line 2 (Red)
+             l2_start = (int(speed_estimator.line2[0]*width), int(speed_estimator.line2[1]*height))
+             l2_end = (int(speed_estimator.line2[2]*width), int(speed_estimator.line2[3]*height))
+             cv2.line(annotated_frame, l2_start, l2_end, (0, 0, 255), 2)
+             cv2.putText(annotated_frame, "END", l2_start, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        
         # Draw Traces
         annotated_frame = self.trace_annotator.annotate(
             scene=annotated_frame,
@@ -167,9 +259,13 @@ class TrafficVisualizer:
                 label = f"#{tracker_id} {class_name}"
                 
                 # Add speed info if available
-                if speed_estimator and tracker_id in speed_estimator.speeds:
-                    speed = speed_estimator.speeds[tracker_id]
-                    label += f" {speed:.1f} px/f"
+                # Check completed speeds first
+                if speed_estimator and tracker_id in speed_estimator.completed_speeds:
+                    speed_data = speed_estimator.completed_speeds[tracker_id]
+                    speed = speed_data['speed']
+                    label += f" {speed:.1f} km/h"
+                elif speed_estimator and tracker_id in speed_estimator.entry_times:
+                     label += " Measuring..."
                     
                 labels.append(label)
         else:

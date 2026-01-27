@@ -21,7 +21,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 # Import our custom CV engine
-from traffic_engine import ObjectDetector, ObjectTracker, StatsManager, TrafficVisualizer, SpeedEstimator, COCO_CLASSES
+from traffic_engine import ObjectDetector, ObjectTracker, StatsManager, TrafficVisualizer, LineSpeedEstimator, COCO_CLASSES
+from db_manager import DatabaseManager
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -56,7 +57,8 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         self.tracker = ObjectTracker()
         self.stats = StatsManager()
         self.visualizer = TrafficVisualizer()
-        self.speed_estimator = SpeedEstimator()
+        self.speed_estimator = LineSpeedEstimator()
+        self.db = DatabaseManager()
         
         # Video Capture
         self.cap = cv2.VideoCapture(self.source_path)
@@ -77,12 +79,34 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         detections = self.tracker.update(detections)
         
         # 3. Speed
-        self.speed_estimator.update(detections)
+        self.speed_estimator.update(detections, frame.shape)
         
-        # 4. Stats
+        # 4. Check for completed events and Log
+        # We iterate over detections to match ID with completed events
+        if detections.tracker_id is not None:
+             for xyxy, class_id, tracker_id in zip(detections.xyxy, detections.class_id, detections.tracker_id):
+                 if tracker_id in self.speed_estimator.completed_speeds:
+                     event = self.speed_estimator.completed_speeds[tracker_id]
+                     # Check if already logged? 
+                     # ideally LineSpeedEstimator should have a queue of 'newly completed'
+                     # For now, we will add a 'logged' flag in completed_speeds or pop it
+                     
+                     if not event.get("logged", False):
+                         class_name = COCO_CLASSES[class_id]
+                         self.db.log_event(
+                             frame=frame,
+                             bbox=xyxy,
+                             class_name=class_name,
+                             speed=event['speed'],
+                             direction=event['direction'],
+                             video_source=os.path.basename(self.source_path)
+                         )
+                         event["logged"] = True
+
+        # 5. Stats
         self.stats.update(detections)
         
-        # 5. Annotate
+        # 6. Annotate
         annotated_frame = self.visualizer.annotate(frame, detections, self.stats, self.speed_estimator)
         
         return annotated_frame
@@ -235,6 +259,25 @@ async def on_shutdown():
     coros = [pc.close() for pc in pcs]
     await asyncio.gather(*coros)
     pcs.clear()
+
+# --- Speed Config Endpoint ---
+@app.post("/api/config/lines")
+async def config_lines(request: Request):
+    data = await request.json()
+    line1 = data.get("line1")
+    line2 = data.get("line2")
+    distance = data.get("distance", 5.0)
+    
+    # Update all active tracks (or store in a global config for new tracks)
+    # Ideally we should only have one active track usually?
+    for pc in pcs:
+        for transceiver in pc.getTransceivers():
+             if transceiver.sender.track and isinstance(transceiver.sender.track, TrafficAnalysisTrack):
+                 track = transceiver.sender.track
+                 track.speed_estimator.set_config(line1, line2, distance)
+                 logger.info("Updated speed config for active track.")
+                 
+    return {"status": "updated"}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
