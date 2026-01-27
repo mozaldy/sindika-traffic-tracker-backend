@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+aiortc
+av
+opencv-python
+supervision
+numpy
+python-multipart
+requests
