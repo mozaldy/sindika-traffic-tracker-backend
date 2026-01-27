@@ -6,6 +6,7 @@ import logging
 import os
 import cv2
 import platform
+import shutil
 from typing import List, Optional
 
 
@@ -13,7 +14,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, File, UploadFile
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -95,18 +96,28 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         # Read frame from OpenCV
         ret, frame = self.cap.read()
         if not ret:
-            # Loop video
-            logger.info("Video finished, looping...")
-            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            # Loop video: Re-open the file to handle different codecs/containers
+            logger.info("Video finished, looping (re-opening file)...")
+            self.cap.release()
+            self.cap = cv2.VideoCapture(self.source_path)
+            
+            # Additional check if re-open succeeded
+            if not self.cap.isOpened():
+                logger.error(f"Failed to re-open video source: {self.source_path}")
+                return None
+
             ret, frame = self.cap.read()
             if not ret:
                 # If still failing, return a black frame or error
-                logger.error("Could not read frame even after loop.")
+                logger.error("Could not read frame even after re-opening.")
                 return None # This might close the track
 
         # Run CV Pipeline in a separate thread to ensure we don't block the AsyncIO loop (which handles WebRTC heartbeats)
         annotated_frame = await self.loop.run_in_executor(None, self._process_frame, frame)
         
+        if annotated_frame is None: 
+             return None
+
         # Convert to WebRTC Frame (AV)
         # OpenCV is BGR, av.VideoFrame.from_ndarray expects BGR if format='bgr24'
         new_frame = VideoFrame.from_ndarray(annotated_frame, format="bgr24")
@@ -145,18 +156,47 @@ pcs = set()
 async def read_root():
     return open(os.path.join(ROOT_DIR, "static/index.html")).read()
 
+# --- Video Management ---
+VIDEO_DIR = os.path.join(ROOT_DIR, "videos")
+if not os.path.exists(VIDEO_DIR):
+    os.makedirs(VIDEO_DIR)
+
+@app.post("/api/upload")
+async def upload_video(file: UploadFile = File(...)):
+    try:
+        file_path = os.path.join(VIDEO_DIR, file.filename)
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        logger.info(f"Uploaded video: {file.filename}")
+        return {"filename": file.filename, "status": "success"}
+    except Exception as e:
+        logger.error(f"Upload failed: {e}")
+        return JSONResponse(status_code=500, content={"message": str(e)})
+
+@app.get("/api/videos")
+async def list_videos():
+    files = []
+        
+    if os.path.exists(VIDEO_DIR):
+        for f in os.listdir(VIDEO_DIR):
+            if f.endswith(('.mp4', '.avi', '.mov')):
+                files.append(f)
+    return {"videos": sorted(list(set(files)))}
+
 @app.post("/api/offer")
 async def offer(request: Request):
     params = await request.json()
     sdp = params["sdp"]
     type_ = params["type"]
-    
+    video_source_name = params.get("video_source")
+    target_classes = params.get("target_classes", ["person", "car", "motorcycle", "truck", "bus"])
+
     offer = RTCSessionDescription(sdp=sdp, type=type_)
     
     pc = RTCPeerConnection()
     pcs.add(pc)
     
-    logger.info("Created new PeerConnection")
+    logger.info(f"Created new PeerConnection. Selected Source: {video_source_name}, Classes: {target_classes}")
     
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
@@ -165,16 +205,17 @@ async def offer(request: Request):
             await pc.close()
             pcs.discard(pc)
     
-    # Create our custom video track
-    # NOTE: In a real app, source might be dynamic
-    video_source = "./traffic_fixed.mp4"
-    if not os.path.exists(video_source):
-        # Fallback for testing if file moved
-        video_source = "../traffic.mp4"
+    # Determine absolute path for video source
+    if not video_source_name:
+        return JSONResponse(status_code=400, content={"message": "No video source selected. Please upload a video."})
+
+    video_path = os.path.join(VIDEO_DIR, video_source_name)
         
-    target_classes = ["person", "car", "motorcycle", "truck"]
+    if not os.path.exists(video_path):
+         logger.error(f"Source {video_path} not found.")
+         return JSONResponse(status_code=404, content={"message": f"Video '{video_source_name}' not found. Please upload it."})
     
-    video_track = TrafficAnalysisTrack(video_source, target_classes)
+    video_track = TrafficAnalysisTrack(video_path, target_classes)
     
     pc.addTrack(video_track)
 
