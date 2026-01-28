@@ -249,7 +249,7 @@ class PolygonZoneEstimator:
                         if tracker_id in self.entry_positions:
                             del self.entry_positions[tracker_id]
                         if tracker_id in self.active_trails:
-                            del self.active_trails[tracker_id]
+                            pass # Keep trail for visualization (turn green)
 
             self.last_positions[tracker_id] = curr_pos
 
@@ -336,7 +336,18 @@ class TrafficVisualizer:
         if speed_estimator:
             for tid, trail in speed_estimator.active_trails.items():
                 if len(trail) > 1:
-                    cv2.polylines(annotated_frame, [np.array(trail, dtype=np.int32)], False, (0, 255, 255), 2)
+                    color = None
+                    thickness = 2
+                    
+                    # Logic: Only draw if passing through (In Zone) or Completed
+                    if tid in speed_estimator.completed_speeds:
+                        color = (0, 255, 0) # Green for Success
+                        thickness = 3
+                    elif tid in speed_estimator.objects_in_zone:
+                         color = (0, 255, 255) # Yellow for In-Progress
+                         
+                    if color:
+                        cv2.polylines(annotated_frame, [np.array(trail, dtype=np.int32)], False, color, thickness)
 
         # Draw Boxes
         annotated_frame = self.box_annotator.annotate(

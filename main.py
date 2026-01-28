@@ -381,7 +381,8 @@ async def config_lines(request: Request):
 @app.post("/api/config/zone")
 async def config_zone(request: Request):
     data = await request.json()
-    zone = data.get("zone") # List of floats/points
+    # Support both keys for robustness
+    zone = data.get("zone") or data.get("polygon") 
     distance = data.get("distance", 5.0)
     
     # Try to save this as 'polygon' in the config for persistence
@@ -394,8 +395,9 @@ async def config_zone(request: Request):
         for transceiver in pc.getTransceivers():
              if transceiver.sender.track and isinstance(transceiver.sender.track, TrafficAnalysisTrack):
                  track = transceiver.sender.track
-                 track.speed_estimator.set_config(zone, distance)
-                 logger.info("Updated zone config for active track via config/zone.")
+                 if zone:
+                     track.speed_estimator.set_config(zone, distance)
+                     logger.info("Updated zone config for active track via config/zone.")
                  
     return {"status": "updated"}
 
