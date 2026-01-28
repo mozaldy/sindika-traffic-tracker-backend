@@ -14,7 +14,7 @@ from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
 from aiortc.contrib.media import MediaRelay
 from av import VideoFrame
 
-from fastapi import FastAPI, Request, File, UploadFile
+from fastapi import FastAPI, Request, File, UploadFile, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +29,22 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("traffic_server")
 
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# --- Config Persistence ---
+CONFIG_FILE = os.path.join(ROOT_DIR, "config.json")
+
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_config(config):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(config, f)
 
 class TrafficAnalysisTrack(VideoStreamTrack):
     """
@@ -58,6 +74,21 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         self.stats = StatsManager()
         self.visualizer = TrafficVisualizer()
         self.speed_estimator = PolygonZoneEstimator()
+        
+        # Load saved config
+        config = load_config()
+        if "polygon" in config:
+             self.speed_estimator.set_config(
+                config["polygon"],
+                config.get("distance", 5.0)
+            )
+        elif "line1" in config and "line2" in config:
+            self.speed_estimator.set_config_lines(
+                config["line1"],
+                config["line2"],
+                config.get("distance", 5.0)
+            )
+
         self.db = DatabaseManager()
         
         # Video Capture
@@ -65,9 +96,18 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         if not self.cap.isOpened():
             logger.error(f"Failed to open video source: {self.source_path}")
             
+        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.duration_sec = self.total_frames / self.fps if self.fps > 0 else 0
+
         self.loop = asyncio.get_event_loop()
         
-    def _process_frame(self, frame):
+    def _format_time(self, seconds):
+        mins = int(seconds // 60)
+        secs = int(seconds % 60)
+        return f"{mins:02d}:{secs:02d}"
+
+    def _process_frame(self, frame, timestamp_info, timestamp_sec):
         """
         Sync function to run the CV pipeline.
         """
@@ -79,7 +119,7 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         detections = self.tracker.update(detections)
         
         # 3. Speed
-        self.speed_estimator.update(detections, frame.shape)
+        self.speed_estimator.update(detections, frame.shape, timestamp_sec)
         
         # 4. Check for completed events and Log
         # We iterate over detections to match ID with completed events
@@ -87,9 +127,6 @@ class TrafficAnalysisTrack(VideoStreamTrack):
              for xyxy, class_id, tracker_id in zip(detections.xyxy, detections.class_id, detections.tracker_id):
                  if tracker_id in self.speed_estimator.completed_speeds:
                      event = self.speed_estimator.completed_speeds[tracker_id]
-                     # Check if already logged? 
-                     # ideally LineSpeedEstimator should have a queue of 'newly completed'
-                     # For now, we will add a 'logged' flag in completed_speeds or pop it
                      
                      if not event.get("logged", False):
                          class_name = COCO_CLASSES[class_id]
@@ -98,9 +135,11 @@ class TrafficAnalysisTrack(VideoStreamTrack):
                              bbox=xyxy,
                              class_name=class_name,
                              speed=event['speed'],
-                             direction=event['direction'], # Angle in degrees
-                             direction_symbol=event.get('direction_symbol'), # Add implementation for symbol passing
-                             video_source=os.path.basename(self.source_path)
+                             direction=event['direction'], # Relative Angle
+                             direction_symbol=event.get('direction_symbol'),
+                             video_source=os.path.basename(self.source_path),
+                             crossing_start=event.get('start_time', 0.0),
+                             crossing_end=event.get('end_time', 0.0)
                          )
                          event["logged"] = True
 
@@ -108,7 +147,7 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         self.stats.update(detections)
         
         # 6. Annotate
-        annotated_frame = self.visualizer.annotate(frame, detections, self.stats, self.speed_estimator)
+        annotated_frame = self.visualizer.annotate(frame, detections, self.stats, self.speed_estimator, timestamp_info)
         
         return annotated_frame
 
@@ -124,6 +163,7 @@ class TrafficAnalysisTrack(VideoStreamTrack):
             # Loop video: Re-open the file to handle different codecs/containers
             logger.info("Video finished, looping (re-opening file)...")
             self.cap.release()
+            
             self.cap = cv2.VideoCapture(self.source_path)
             
             # Additional check if re-open succeeded
@@ -137,8 +177,13 @@ class TrafficAnalysisTrack(VideoStreamTrack):
                 logger.error("Could not read frame even after re-opening.")
                 return None # This might close the track
 
+        # Calculate Timestamp Info
+        current_frame_pos = self.cap.get(cv2.CAP_PROP_POS_FRAMES)
+        current_sec = current_frame_pos / self.fps if self.fps > 0 else 0
+        timestamp_str = f"{self._format_time(current_sec)} / {self._format_time(self.duration_sec)}"
+
         # Run CV Pipeline in a separate thread to ensure we don't block the AsyncIO loop (which handles WebRTC heartbeats)
-        annotated_frame = await self.loop.run_in_executor(None, self._process_frame, frame)
+        annotated_frame = await self.loop.run_in_executor(None, self._process_frame, frame, timestamp_str, current_sec)
         
         if annotated_frame is None: 
              return None
@@ -208,6 +253,35 @@ async def list_videos():
                 files.append(f)
     return {"videos": sorted(list(set(files)))}
 
+@app.get("/api/video_preview")
+async def video_preview(video_source: str):
+    if not video_source:
+        return Response(status_code=400)
+        
+    # Resolve path consistent with other endpoints
+    # 1. Check if absolute or direct relative path exists
+    if os.path.exists(video_source):
+        path = video_source
+    else:
+        # 2. Check in VIDEO_DIR
+        path = os.path.join(VIDEO_DIR, video_source)
+        if not os.path.exists(path):
+             return Response(status_code=404, content="Video not found")
+
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+         return Response(status_code=500, content="Could not open video")
+    
+    ret, frame = cap.read()
+    cap.release()
+    
+    if ret:
+        success, buffer = cv2.imencode('.jpg', frame)
+        if success:
+            return Response(content=buffer.tobytes(), media_type="image/jpeg")
+            
+    return Response(status_code=500, content="Could not read frame")
+
 @app.post("/api/offer")
 async def offer(request: Request):
     params = await request.json()
@@ -261,21 +335,67 @@ async def on_shutdown():
     await asyncio.gather(*coros)
     pcs.clear()
 
-# --- Speed Config Endpoint ---
+# --- Config Endpoints ---
+
+@app.get("/api/config/lines")
+async def get_config_lines():
+    config = load_config()
+    return config
+
+@app.post("/api/config/lines")
+async def config_lines(request: Request):
+    data = await request.json()
+    
+    # Save to disk (Persistent)
+    save_config(data)
+    
+    polygon = data.get("polygon")
+   
+    distance = data.get("distance", 5.0)
+    
+    # Update all active tracks
+    for pc in pcs:
+        for transceiver in pc.getTransceivers():
+             if transceiver.sender.track and isinstance(transceiver.sender.track, TrafficAnalysisTrack):
+                 track = transceiver.sender.track
+                 if polygon:
+                    # Generic polygon update
+                    track.speed_estimator.set_config(polygon, distance)
+                 else:
+                     # Fallback line update (which maps to polygon)
+                     line1 = data.get("line1")
+                     line2 = data.get("line2")
+                     if line1 and line2:
+                         track.speed_estimator.set_config_lines(line1, line2, distance)
+                         
+                 logger.info("Updated speed config for active track via config/lines.")
+                 
+    return {"status": "updated"}
+
+# Support the config/zone endpoint (Friend's API) but link it to persistence if desired
+# Or just keep it ephemeral? User's legacy code used persistence.
+# Let's make this endpoint ALSO save if we want consistency, but friend's code didn't seem to have save logic.
+# I'll just make it update the active track, but maybe NOT save to `lines` config logic to avoid format clashes unless we unify.
+# User's frontend calls config/lines?
+# If I look at the diffs, `config_zone` endpoint was Friend's work.
 @app.post("/api/config/zone")
 async def config_zone(request: Request):
     data = await request.json()
-    zone = data.get("zone") # List of floats
+    zone = data.get("zone") # List of floats/points
     distance = data.get("distance", 5.0)
     
-    # Update all active tracks (or store in a global config for new tracks)
-    # Ideally we should only have one active track usually?
+    # Try to save this as 'polygon' in the config for persistence
+    current_config = load_config()
+    current_config["polygon"] = zone
+    current_config["distance"] = distance
+    save_config(current_config)
+
     for pc in pcs:
         for transceiver in pc.getTransceivers():
              if transceiver.sender.track and isinstance(transceiver.sender.track, TrafficAnalysisTrack):
                  track = transceiver.sender.track
                  track.speed_estimator.set_config(zone, distance)
-                 logger.info("Updated zone config for active track.")
+                 logger.info("Updated zone config for active track via config/zone.")
                  
     return {"status": "updated"}
 
@@ -284,8 +404,6 @@ async def config_zone(request: Request):
 async def get_events(limit: int = 100, offset: int = 0):
     db = DatabaseManager()
     events = db.get_events(limit, offset)
-    # Add captures url prefix if needed, or serve captures statically
-    # Currently captures are just files. We need to serve them.
     return {"events": events}
 
 @app.delete("/api/events/{event_id}")

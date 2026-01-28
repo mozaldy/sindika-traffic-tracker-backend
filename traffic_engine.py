@@ -53,85 +53,121 @@ class PolygonZoneEstimator:
     Direction = Vector from Entry Point to Exit Point.
     """
     def __init__(self):
-        # Zone points: [(x1,y1), (x2, y2), ...] (Normalized 0-1)
+        # Zone polygon points
         self.zone_polygon = None
-        self.real_distance = 5.0 # meters (approximate crossing distance)
         
-        # Tracker State
-        # {tracker_id: deque([(x,y), ...], maxlen=30)}
-        self.position_history: Dict[int, Deque] = {}
+        # Real world approximate distance of the path through the zone (or gate)
+        self.real_distance = 5.0 # meters
+        self.lane_direction_degrees = 90.0 # Default down
         
         # Detection State
         self.entry_times: Dict[int, float] = {}
         self.entry_positions: Dict[int, tuple] = {}
-        self.exit_times: Dict[int, float] = {}
-        self.exit_positions: Dict[int, tuple] = {}
-        
         self.completed_speeds: Dict[int, Dict] = {} # {id: {speed: X, direction: Y, ...}}
         
         # Track objects currently INSIDE the zone
         self.objects_in_zone: Set[int] = set()
         
-        # Store last known positions
+        # Store last known positions (helper for logic if needed)
         self.last_positions: Dict[int, tuple] = {}
+        
+        # Smoothing History for robust IN/OUT checks
+        self.position_history: Dict[int, Deque] = {}
+        
+        # Active trails for visualization
+        self.active_trails: Dict[int, List[tuple]] = {}
 
     def set_config(self, zone_points: List[float], distance: float):
         """
-        zone_points as [x1, y1, x2, y2, ...]
+        zone_points: Flat list [x1, y1, x2, y2, ...] or list of tuples
+        distance: Real world distance in meters
         """
-        # Convert flat list to list of tuples
-        if zone_points and len(zone_points) >= 6: # At least 3 points
-            pts = []
-            for i in range(0, len(zone_points), 2):
-                pts.append((zone_points[i], zone_points[i+1]))
-            self.zone_polygon = np.array(pts, dtype=np.float32)
-            self.real_distance = distance
-            print(f"Zone Config Updated: {len(pts)} points, Dist={distance}m")
-        else:
+        if not zone_points or len(zone_points) < 6:
             print("Invalid zone config received")
+            return
+
+        # Convert to numpy array of shape (N, 2)
+        pts = []
+        for i in range(0, len(zone_points), 2):
+            pts.append((zone_points[i], zone_points[i+1]))
+        self.zone_polygon = np.array(pts, dtype=np.float32)
+        self.real_distance = distance
+        
+        # Calculate Lane Direction if it looks like a Quadrilateral (4 points)
+        # We assume order: StartP0, StartP1, EndP2, EndP3 (or similar 8-point rect definitions)
+        # Actually, standard rect order: P0, P1, P2, P3.
+        # Let's assume P0-P1 is START edge and P3-P2 is END edge (standard box).
+        # Midpoint Start
+        if len(pts) == 4:
+            mx_start = (pts[0][0] + pts[1][0]) / 2
+            my_start = (pts[0][1] + pts[1][1]) / 2
+            
+            # Midpoint End
+            mx_end = (pts[3][0] + pts[2][0]) / 2
+            my_end = (pts[3][1] + pts[2][1]) / 2
+            
+            dx_lane = mx_end - mx_start
+            dy_lane = my_end - my_start
+            
+            self.lane_direction_degrees = np.degrees(np.arctan2(dy_lane, dx_lane))
+            if self.lane_direction_degrees < 0: self.lane_direction_degrees += 360
+            print(f"Zone Config Updated: {len(pts)} points, Dist={distance}m, LaneDir={self.lane_direction_degrees:.1f}")
+        else:
+             print(f"Zone Config Updated: {len(pts)} points, Dist={distance}m. LaneDir not auto-calculated (using default/prev).")
+
+    def set_config_lines(self, line1: List[float], line2: List[float], distance: float):
+        """
+        Backward compatibility for 2-line config (converts to Quad).
+        Start: line1, End: line2.
+        """
+        # Form a quad: L1_P0, L1_P1, L2_P1, L2_P0 (or appropriate winding)
+        # L1: x1,y1, x2,y2. L2: x3,y3, x4,y4
+        # Quad: L1_start, L1_end, L2_end, L2_start
+        polygon = [
+            line1[0], line1[1], # P0
+            line1[2], line1[3], # P1
+            line2[2], line2[3], # P2 (L2 End) -- Wait, P2 usually follows P1.
+            line2[0], line2[1]  # P3 (L2 Start)
+        ]
+        self.set_config(polygon, distance)
 
     def _get_direction_symbol(self, angle: float) -> str:
         """
         Returns a unicode arrow symbol based on the angle (0-360).
-        0 deg = East (Right)
-        90 deg = South (Down)
-        180 deg = West (Left)
-        270 deg = North (Up)
+        Maps 0 (Relative Forward) to Up Arrow.
+        180 (Relative Backward) to Down Arrow.
+        THIS IS FOR RELATIVE ANGLE VISUALIZATION in console/logs that support unicode.
         """
-        if angle >= 337.5 or angle < 22.5:
-            return "⇨"
-        elif 22.5 <= angle < 67.5:
-            return "⬎"
-        elif 67.5 <= angle < 112.5:
-            return "⇩"
-        elif 112.5 <= angle < 157.5:
-            return "⬐"
-        elif 157.5 <= angle < 202.5:
-            return "⇦"
-        elif 202.5 <= angle < 247.5:
-            return "⬏"
-        elif 247.5 <= angle < 292.5:
-            return "⇧"
-        elif 292.5 <= angle < 337.5:
-            return "⬑"
+        # Map Angle (-180 to 180) to 0-360 for symbol lookup
+        # 0 -> Up (North)
+        # 90 -> Right (East)
+        # 180 -> Down (South)
+        # -90 (270) -> Left (West)
+        
+        # Our Relative Angle: 0 = Forward.
+        # Use simple mapping:
+        # -22.5 to 22.5 -> Forward (Up)
+        if -22.5 <= angle < 22.5: return "↑"
+        if 22.5 <= angle < 67.5: return "↗"
+        if 67.5 <= angle < 112.5: return "→"
+        if 112.5 <= angle < 157.5: return "↘"
+        if 157.5 <= angle <= 180 or -180 <= angle < -157.5: return "↓"
+        if -157.5 <= angle < -112.5: return "↙"
+        if -112.5 <= angle < -67.5: return "←"
+        if -67.5 <= angle < -22.5: return "↖"
         return "?"
 
-    def update(self, detections: sv.Detections, frame_shape):
+    def update(self, detections: sv.Detections, frame_shape, timestamp: float):
         """
         Update zone status and estimations.
         """
         if self.zone_polygon is None:
             return
 
-        import time
         height, width = frame_shape[:2]
-        current_time = time.time()
+        current_time = timestamp
         
-        # Scale polygon to pixel coordinates for checking
-        # self.zone_polygon is user config (0-1)
-        # We need integer array for pointPolygonTest? It works with float but for consistency let's scale
-        # actually pointPolygonTest works nicely with float32 if we just pass scaled coordinates
-        
+        # Scale polygon to pixel coordinates
         zone_pixel = (self.zone_polygon * np.array([width, height], dtype=np.float32)).astype(np.int32)
 
         if detections.tracker_id is None:
@@ -152,6 +188,11 @@ class PolygonZoneEstimator:
                 self.position_history[tracker_id] = deque(maxlen=30)
             self.position_history[tracker_id].append(curr_pos)
             
+            # Update Active Trails (for viz)
+            if tracker_id not in self.active_trails:
+                self.active_trails[tracker_id] = []
+            self.active_trails[tracker_id].append(curr_pos)
+
             # Check Zone Status
             # measureDist=False returns +1 (inside), -1 (outside), 0 (on edge)
             result = cv2.pointPolygonTest(zone_pixel, curr_pos, False)
@@ -164,47 +205,62 @@ class PolygonZoneEstimator:
                 self.objects_in_zone.add(tracker_id)
                 self.entry_times[tracker_id] = current_time
                 self.entry_positions[tracker_id] = curr_pos
-                # print(f"Object {tracker_id} ENTERED zone")
 
             # Event: EXIT Zone
             elif not is_inside and was_inside:
                 self.objects_in_zone.remove(tracker_id)
                 
-                # Check if we have an entry record for this object
+                # Check if we have an entry record
                 if tracker_id in self.entry_times:
                     start_time = self.entry_times[tracker_id]
                     duration = current_time - start_time
                     
-                    if duration > 0.5: # Minimum duration to avoid flickers
+                    if duration > 0.5: # Minimum duration
                         speed_mps = self.real_distance / duration
                         speed_kmh = speed_mps * 3.6
                         
                         start_pos = self.entry_positions[tracker_id]
-                        end_pos = curr_pos # Exit point
+                        end_pos = curr_pos # Exit point (approximated as current pos just outside)
                         
                         dx = end_pos[0] - start_pos[0]
                         dy = end_pos[1] - start_pos[1]
                         
-                        angle = np.degrees(np.arctan2(dy, dx))
-                        if angle < 0: angle += 360
+                        # Absolute Angle
+                        angle_abs = np.degrees(np.arctan2(dy, dx))
+                        if angle_abs < 0: angle_abs += 360
+                        
+                        # Relative Angle (0 = Forward/Along Lane)
+                        angle_rel = angle_abs - self.lane_direction_degrees
+                        # Normalize to [-180, 180]
+                        while angle_rel > 180: angle_rel -= 360
+                        while angle_rel < -180: angle_rel += 360
                         
                         self.completed_speeds[tracker_id] = {
                             "speed": speed_kmh,
-                            "direction": angle,
-                            "direction_symbol": self._get_direction_symbol(angle),
-                            "timestamp": current_time
+                            "direction": angle_rel,
+                            "direction_symbol": self._get_direction_symbol(angle_rel),
+                            "timestamp": current_time,
+                            "start_time": start_time,
+                            "end_time": current_time
                         }
-                        # print(f"Object {tracker_id} EXITED. Speed: {speed_kmh:.1f} km/h, Dir: {angle:.0f}")
+                        
+                        # Cleanup entry data
+                        del self.entry_times[tracker_id]
+                        if tracker_id in self.entry_positions:
+                            del self.entry_positions[tracker_id]
+                        if tracker_id in self.active_trails:
+                            del self.active_trails[tracker_id]
 
             self.last_positions[tracker_id] = curr_pos
 
-        # Cleanup
+        # Cleanup lost tracks
         missing_ids = set(self.last_positions.keys()) - current_ids
         for mid in missing_ids:
             if mid in self.last_positions: del self.last_positions[mid]
             if mid in self.position_history: del self.position_history[mid]
             if mid in self.entry_times: del self.entry_times[mid]
             if mid in self.entry_positions: del self.entry_positions[mid]
+            if mid in self.active_trails: del self.active_trails[mid]
             if mid in self.objects_in_zone: self.objects_in_zone.remove(mid)
 
 class StatsManager:
@@ -221,23 +277,17 @@ class StatsManager:
         """
         Update stats based on current frame detections.
         """
-        # Reset current counts for this frame
         self.current_counts = {}
-        
         if detections.tracker_id is None:
             return
 
         for class_id, tracker_id in zip(detections.class_id, detections.tracker_id):
             class_name = COCO_CLASSES[class_id]
             
-            # Initialize if not present
             if class_name not in self.unique_object_ids:
                 self.unique_object_ids[class_name] = set()
-            
-            # Update Unique
             self.unique_object_ids[class_name].add(tracker_id)
             
-            # Update Current
             self.current_counts[class_name] = self.current_counts.get(class_name, 0) + 1
 
     def get_total_counts(self) -> Dict[str, int]:
@@ -253,9 +303,8 @@ class TrafficVisualizer:
     def __init__(self):
         self.box_annotator = sv.BoxAnnotator()
         self.label_annotator = sv.LabelAnnotator()
-        self.trace_annotator = sv.TraceAnnotator()
 
-    def annotate(self, frame: np.ndarray, detections: sv.Detections, stats: StatsManager, speed_estimator: 'PolygonZoneEstimator' = None) -> np.ndarray:
+    def annotate(self, frame: np.ndarray, detections: sv.Detections, stats: StatsManager, speed_estimator: 'PolygonZoneEstimator' = None, timestamp_info: str = None) -> np.ndarray:
         """
         Draw boxes, labels, traces, stats, and speed.
         """
@@ -267,24 +316,27 @@ class TrafficVisualizer:
              
              # Scale back to pixels
              zone_pixel = (speed_estimator.zone_polygon * np.array([width, height], dtype=np.float32)).astype(np.int32)
-             
              # Reshape for polylines (N, 1, 2)
              zone_pixel = zone_pixel.reshape((-1, 1, 2))
              
              cv2.polylines(annotated_frame, [zone_pixel], True, (0, 255, 0), 2)
              
-             # Draw Label Center
-             # M = cv2.moments(zone_pixel)
-             # if M["m00"] != 0:
-             #    cX = int(M["m10"] / M["m00"])
-             #    cY = int(M["m01"] / M["m00"])
-             #    cv2.putText(annotated_frame, "ZONE", (cX-20, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-        
-        # Draw Traces
-        annotated_frame = self.trace_annotator.annotate(
-            scene=annotated_frame,
-            detections=detections
-        )
+             # Identify Start/End for visual clarity if it's a quad
+             if len(zone_pixel) == 4:
+                 pts = zone_pixel.reshape(4, 2)
+                 # Start Line (P0-P1)
+                 cv2.line(annotated_frame, tuple(pts[0]), tuple(pts[1]), (0, 255, 0), 2)
+                 cv2.putText(annotated_frame, "START", tuple(pts[0]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                 
+                 # End Line (P3-P2)
+                 cv2.line(annotated_frame, tuple(pts[3]), tuple(pts[2]), (0, 0, 255), 2)
+                 cv2.putText(annotated_frame, "END", tuple(pts[3]), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        # Draw Active Trails
+        if speed_estimator:
+            for tid, trail in speed_estimator.active_trails.items():
+                if len(trail) > 1:
+                    cv2.polylines(annotated_frame, [np.array(trail, dtype=np.int32)], False, (0, 255, 255), 2)
 
         # Draw Boxes
         annotated_frame = self.box_annotator.annotate(
@@ -300,14 +352,14 @@ class TrafficVisualizer:
                 label = f"#{tracker_id} {class_name}"
                 
                 # Add speed info if available
-                # Check completed speeds first
-                if speed_estimator and tracker_id in speed_estimator.completed_speeds:
-                    speed_data = speed_estimator.completed_speeds[tracker_id]
-                    speed = speed_data['speed']
-                    symbol = speed_data.get('direction_symbol', '')
-                    label += f" {speed:.1f} km/h {symbol}"
-                elif speed_estimator and tracker_id in speed_estimator.objects_in_zone:
-                     label += " In Zone"
+                if speed_estimator:
+                    if tracker_id in speed_estimator.completed_speeds:
+                        speed_data = speed_estimator.completed_speeds[tracker_id]
+                        speed = speed_data['speed']
+                        symbol = speed_data.get('direction_symbol', '')
+                        label += f" {speed:.1f} km/h {symbol}"
+                    elif tracker_id in speed_estimator.objects_in_zone:
+                         label += " In Zone"
                     
                 labels.append(label)
         else:
@@ -321,5 +373,10 @@ class TrafficVisualizer:
             detections=detections,
             labels=labels
         )
+
+        # Draw Timestamp
+        if timestamp_info:
+            cv2.putText(annotated_frame, timestamp_info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(annotated_frame, timestamp_info, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 0), 1, cv2.LINE_AA)
 
         return annotated_frame

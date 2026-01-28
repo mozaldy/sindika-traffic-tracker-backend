@@ -30,21 +30,40 @@ class DatabaseManager:
                 direction_deg REAL,
                 direction_symbol TEXT,
                 image_path TEXT,
-                video_source TEXT
+                video_source TEXT,
+                crossing_start REAL,
+                crossing_end REAL
             )
         ''')
         
-        # Backward compatibility: Check if direction_symbol column exists, if not add it
+        # Migration 1: Direction Symbol
         c.execute("PRAGMA table_info(traffic_events)")
-        columns = [info[1] for info in c.fetchall()]
-        if 'direction_symbol' not in columns:
+        existing_columns = [info[1] for info in c.fetchall()]
+        
+        if 'direction_symbol' not in existing_columns:
             print("Migrating DB: Adding direction_symbol column...")
-            c.execute("ALTER TABLE traffic_events ADD COLUMN direction_symbol TEXT")
+            try:
+                c.execute("ALTER TABLE traffic_events ADD COLUMN direction_symbol TEXT")
+            except sqlite3.OperationalError:
+                pass
+
+        # Migration 2: Crossing Timestamps
+        if 'crossing_start' not in existing_columns:
+            try:
+                c.execute('ALTER TABLE traffic_events ADD COLUMN crossing_start REAL')
+            except sqlite3.OperationalError:
+                pass
+        
+        if 'crossing_end' not in existing_columns:
+            try:
+                c.execute('ALTER TABLE traffic_events ADD COLUMN crossing_end REAL')
+            except sqlite3.OperationalError:
+                pass
             
         conn.commit()
         conn.close()
 
-    def log_event(self, frame: np.ndarray, bbox: list, class_name: str, speed: float, direction: float, direction_symbol: str = None, video_source="unknown"):
+    def log_event(self, frame: np.ndarray, bbox: list, class_name: str, speed: float, direction: float, direction_symbol: str = None, video_source="unknown", crossing_start=0.0, crossing_end=0.0):
         """
         Logs an event: Crops image, saves to disk, inserts into DB.
         bbox: [x1, y1, x2, y2]
@@ -72,9 +91,9 @@ class DatabaseManager:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
             c.execute('''
-                INSERT INTO traffic_events (timestamp, class_name, speed_kmh, direction_deg, direction_symbol, image_path, video_source)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ''', (timestamp, class_name, float(speed), float(direction), direction_symbol, file_path, video_source))
+                INSERT INTO traffic_events (timestamp, class_name, speed_kmh, direction_deg, direction_symbol, image_path, video_source, crossing_start, crossing_end)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (timestamp, class_name, float(speed), float(direction), direction_symbol, file_path, video_source, crossing_start, crossing_end))
             conn.commit()
             conn.close()
             
