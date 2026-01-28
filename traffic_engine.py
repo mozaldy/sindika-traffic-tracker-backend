@@ -116,6 +116,65 @@ class PolygonZoneEstimator:
             return "⬑"
         return "?"
 
+    def _ccw(self, A, B, C):
+        return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+
+    def _intersect(self, A, B, C, D):
+        """
+        Return true if line segments AB and CD intersect
+        """
+        return self._ccw(A,C,D) != self._ccw(B,C,D) and self._ccw(A,B,C) != self._ccw(A,B,D)
+
+    def _get_crossed_edge(self, prev_pos, curr_pos, shape):
+        """
+        Finds which edge of the polygon was crossed by the segment prev_pos -> curr_pos.
+        Returns edge index (0-3) or None.
+        """
+        if self.zone_polygon is None or len(self.zone_polygon) < 3:
+            return None
+            
+        height, width = shape[:2]
+        # zone_polygon is normalized 0-1. Scale to pixels for intersection check.
+        # But prev_pos, curr_pos are in pixels.
+        
+        # We need the edges in pixels
+        poly_pixels = (self.zone_polygon * np.array([width, height], dtype=np.float32)).astype(np.int32)
+        
+        num_points = len(poly_pixels)
+        for i in range(num_points):
+            p1 = poly_pixels[i]
+            p2 = poly_pixels[(i + 1) % num_points] # Wrap around
+            
+            # Check intersection
+            if self._intersect(prev_pos, curr_pos, p1, p2):
+                return i
+        return None
+
+    def _get_line_direction_symbol(self, entry_idx: int, exit_idx: int) -> str:
+        """
+        Returns symbol based on Entry Line -> Exit Line.
+        Indices are 0-based (0=Top/1, 1=Right/2, 2=Bottom/3, 3=Left/4)
+        """
+        mapping = {
+            (0, 2): "⇩", # 1 -> 3
+            (2, 0): "⇧", # 3 -> 1
+            (1, 3): "⇦", # 2 -> 4
+            (3, 1): "⇨", # 4 -> 2
+            
+            (0, 1): "↳", # 1 -> 2 (Top->Right)
+            (1, 0): "⬑", # 2 -> 1 (Right->Top)
+            
+            (0, 3): "↲", # 1 -> 4 (Top->Left)
+            (3, 0): "⬏", # 4 -> 1 (Left->Top)
+            
+            (2, 1): "↱", # 3 -> 2 (Bottom->Right)
+            (1, 2): "⬐", # 2 -> 3 (Right->Bottom)
+            
+            (2, 3): "↰", # 3 -> 4 (Bottom->Left)
+            (3, 2): "⬎", # 4 -> 3 (Left->Bottom)
+        }
+        return mapping.get((entry_idx, exit_idx), "?")
+
     def update(self, detections: sv.Detections, frame_shape):
         """
         Update zone status and estimations.
@@ -164,7 +223,17 @@ class PolygonZoneEstimator:
                 self.objects_in_zone.add(tracker_id)
                 self.entry_times[tracker_id] = current_time
                 self.entry_positions[tracker_id] = curr_pos
-                # print(f"Object {tracker_id} ENTERED zone")
+                
+                # Determine Entry Edge
+                if tracker_id in self.last_positions:
+                    prev_pos = self.last_positions[tracker_id]
+                    entry_edge = self._get_crossed_edge(prev_pos, curr_pos, frame_shape)
+                    # Store entry edge? We can store it in a new dict or reuse positions
+                    # Let's create a new dict for entry_edges to be clean
+                    if not hasattr(self, 'entry_edges'): self.entry_edges = {}
+                    if entry_edge is not None:
+                        self.entry_edges[tracker_id] = entry_edge
+                        # print(f"Object {tracker_id} ENTERED via Edge {entry_edge+1}")
 
             # Event: EXIT Zone
             elif not is_inside and was_inside:
@@ -175,26 +244,45 @@ class PolygonZoneEstimator:
                     start_time = self.entry_times[tracker_id]
                     duration = current_time - start_time
                     
-                    if duration > 0.5: # Minimum duration to avoid flickers
+                    if duration > 0.5: # Minimum duration
                         speed_mps = self.real_distance / duration
                         speed_kmh = speed_mps * 3.6
                         
-                        start_pos = self.entry_positions[tracker_id]
-                        end_pos = curr_pos # Exit point
+                        # Determine Exit Edge
+                        exit_edge = None
+                        if tracker_id in self.last_positions:
+                            prev_pos = self.last_positions[tracker_id]
+                            exit_edge = self._get_crossed_edge(prev_pos, curr_pos, frame_shape)
+                            # print(f"Object {tracker_id} EXITED via Edge {exit_edge+1}")
+
+                        # Get Entry Edge
+                        entry_edge = getattr(self, 'entry_edges', {}).get(tracker_id)
                         
+                        symbol = "?"
+                        angle = 0
+                        
+                        # Calculate Symbol from Edges if available
+                        if entry_edge is not None and exit_edge is not None:
+                            symbol = self._get_line_direction_symbol(entry_edge, exit_edge)
+                        
+                        # Fallback to angle calculation if symbol is unknown (e.g. invalid edge crossing)
+                        # Or calculate angle anyway for DB
+                        start_pos = self.entry_positions[tracker_id]
+                        end_pos = curr_pos
                         dx = end_pos[0] - start_pos[0]
                         dy = end_pos[1] - start_pos[1]
-                        
                         angle = np.degrees(np.arctan2(dy, dx))
                         if angle < 0: angle += 360
                         
+                        if symbol == "?":
+                             symbol = self._get_direction_symbol(angle)
+
                         self.completed_speeds[tracker_id] = {
                             "speed": speed_kmh,
                             "direction": angle,
-                            "direction_symbol": self._get_direction_symbol(angle),
+                            "direction_symbol": symbol,
                             "timestamp": current_time
                         }
-                        # print(f"Object {tracker_id} EXITED. Speed: {speed_kmh:.1f} km/h, Dir: {angle:.0f}")
 
             self.last_positions[tracker_id] = curr_pos
 
@@ -206,6 +294,7 @@ class PolygonZoneEstimator:
             if mid in self.entry_times: del self.entry_times[mid]
             if mid in self.entry_positions: del self.entry_positions[mid]
             if mid in self.objects_in_zone: self.objects_in_zone.remove(mid)
+            if hasattr(self, 'entry_edges') and mid in self.entry_edges: del self.entry_edges[mid]
 
 class StatsManager:
     """
@@ -269,16 +358,27 @@ class TrafficVisualizer:
              zone_pixel = (speed_estimator.zone_polygon * np.array([width, height], dtype=np.float32)).astype(np.int32)
              
              # Reshape for polylines (N, 1, 2)
-             zone_pixel = zone_pixel.reshape((-1, 1, 2))
+             zone_pixel_reshaped = zone_pixel.reshape((-1, 1, 2))
              
-             cv2.polylines(annotated_frame, [zone_pixel], True, (0, 255, 0), 2)
+             cv2.polylines(annotated_frame, [zone_pixel_reshaped], True, (0, 255, 0), 2)
              
-             # Draw Label Center
-             # M = cv2.moments(zone_pixel)
-             # if M["m00"] != 0:
-             #    cX = int(M["m10"] / M["m00"])
-             #    cY = int(M["m01"] / M["m00"])
-             #    cv2.putText(annotated_frame, "ZONE", (cX-20, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+             # Draw Edge Numbers (1, 2, 3, 4)
+             num_points = len(zone_pixel)
+             for i in range(num_points):
+                 p1 = zone_pixel[i]
+                 p2 = zone_pixel[(i + 1) % num_points]
+                 
+                 # Midpoint
+                 mid_x = int((p1[0] + p2[0]) / 2)
+                 mid_y = int((p1[1] + p2[1]) / 2)
+                 
+                 # Label: i+1 (Since 0-index = Line 1)
+                 label = str(i + 1)
+                 
+                 # Draw background for visibility
+                 (text_w, text_h), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)
+                 cv2.circle(annotated_frame, (mid_x, mid_y), int(max(text_w, text_h)), (0, 0, 0), -1)
+                 cv2.putText(annotated_frame, label, (mid_x - text_w//2, mid_y + text_h//2), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
         # Draw Traces
         annotated_frame = self.trace_annotator.annotate(
