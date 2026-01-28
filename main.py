@@ -21,7 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 # Import our custom CV engine
-from traffic_engine import ObjectDetector, ObjectTracker, StatsManager, TrafficVisualizer, LineSpeedEstimator, COCO_CLASSES
+from traffic_engine import ObjectDetector, ObjectTracker, StatsManager, TrafficVisualizer, PolygonZoneEstimator, COCO_CLASSES
 from db_manager import DatabaseManager
 
 # Configure Logging
@@ -57,7 +57,7 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         self.tracker = ObjectTracker()
         self.stats = StatsManager()
         self.visualizer = TrafficVisualizer()
-        self.speed_estimator = LineSpeedEstimator()
+        self.speed_estimator = PolygonZoneEstimator()
         self.db = DatabaseManager()
         
         # Video Capture
@@ -98,7 +98,8 @@ class TrafficAnalysisTrack(VideoStreamTrack):
                              bbox=xyxy,
                              class_name=class_name,
                              speed=event['speed'],
-                             direction=event['direction'],
+                             direction=event['direction'], # Angle in degrees
+                             direction_symbol=event.get('direction_symbol'), # Add implementation for symbol passing
                              video_source=os.path.basename(self.source_path)
                          )
                          event["logged"] = True
@@ -261,11 +262,10 @@ async def on_shutdown():
     pcs.clear()
 
 # --- Speed Config Endpoint ---
-@app.post("/api/config/lines")
-async def config_lines(request: Request):
+@app.post("/api/config/zone")
+async def config_zone(request: Request):
     data = await request.json()
-    line1 = data.get("line1")
-    line2 = data.get("line2")
+    zone = data.get("zone") # List of floats
     distance = data.get("distance", 5.0)
     
     # Update all active tracks (or store in a global config for new tracks)
@@ -274,8 +274,8 @@ async def config_lines(request: Request):
         for transceiver in pc.getTransceivers():
              if transceiver.sender.track and isinstance(transceiver.sender.track, TrafficAnalysisTrack):
                  track = transceiver.sender.track
-                 track.speed_estimator.set_config(line1, line2, distance)
-                 logger.info("Updated speed config for active track.")
+                 track.speed_estimator.set_config(zone, distance)
+                 logger.info("Updated zone config for active track.")
                  
     return {"status": "updated"}
 

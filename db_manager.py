@@ -28,14 +28,23 @@ class DatabaseManager:
                 class_name TEXT,
                 speed_kmh REAL,
                 direction_deg REAL,
+                direction_symbol TEXT,
                 image_path TEXT,
                 video_source TEXT
             )
         ''')
+        
+        # Backward compatibility: Check if direction_symbol column exists, if not add it
+        c.execute("PRAGMA table_info(traffic_events)")
+        columns = [info[1] for info in c.fetchall()]
+        if 'direction_symbol' not in columns:
+            print("Migrating DB: Adding direction_symbol column...")
+            c.execute("ALTER TABLE traffic_events ADD COLUMN direction_symbol TEXT")
+            
         conn.commit()
         conn.close()
 
-    def log_event(self, frame: np.ndarray, bbox: list, class_name: str, speed: float, direction: float, video_source="unknown"):
+    def log_event(self, frame: np.ndarray, bbox: list, class_name: str, speed: float, direction: float, direction_symbol: str = None, video_source="unknown"):
         """
         Logs an event: Crops image, saves to disk, inserts into DB.
         bbox: [x1, y1, x2, y2]
@@ -63,9 +72,9 @@ class DatabaseManager:
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
             c.execute('''
-                INSERT INTO traffic_events (timestamp, class_name, speed_kmh, direction_deg, image_path, video_source)
-                VALUES (?, ?, ?, ?, ?, ?)
-            ''', (timestamp, class_name, float(speed), float(direction), file_path, video_source))
+                INSERT INTO traffic_events (timestamp, class_name, speed_kmh, direction_deg, direction_symbol, image_path, video_source)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (timestamp, class_name, float(speed), float(direction), direction_symbol, file_path, video_source))
             conn.commit()
             conn.close()
             
