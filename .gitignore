@@ -47,3 +47,7 @@ runs/
 # Data & Logs
 captures/
 traffic_data.db
+
+# Local specific
+videos/
+static/

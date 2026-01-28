@@ -46,64 +46,93 @@ class ObjectTracker:
         """
         return self.tracker.update_with_detections(detections)
 
-class LineSpeedEstimator:
+class PolygonZoneEstimator:
     """
-    Estimates speed by detecting when objects cross two defined lines.
-    Speed = Distance / TimeDelta.
+    Estimates speed and direction by detecting when objects ENTER and EXIT a defined polygon zone.
+    Speed = Distance (Diameter/Path) / TimeDelta.
+    Direction = Vector from Entry Point to Exit Point.
     """
     def __init__(self):
-        # Line A and Line B: each is [(x1,y1), (x2, y2)] (Normalized 0-1 if passed that way, but we usually convert later. 
-        # For simplicity, we assume we receive absolute pixel coords or normalized. Let's assume normalized for config.)
-        self.line1 = None
-        self.line2 = None
-        self.real_distance = 5.0 # meters
+        # Zone points: [(x1,y1), (x2, y2), ...] (Normalized 0-1)
+        self.zone_polygon = None
+        self.real_distance = 5.0 # meters (approximate crossing distance)
         
         # Tracker State
-        # {tracker_id: { 'start_time': float, 'last_pos': (x,y) }}
-        self.entry_times: Dict[int, float] = {}
-        self.completed_speeds: Dict[int, Dict] = {} # {id: {speed: X, direction: Y}}
+        # {tracker_id: deque([(x,y), ...], maxlen=30)}
+        self.position_history: Dict[int, Deque] = {}
         
-        # Store last known positions for crossing detection
+        # Detection State
+        self.entry_times: Dict[int, float] = {}
+        self.entry_positions: Dict[int, tuple] = {}
+        self.exit_times: Dict[int, float] = {}
+        self.exit_positions: Dict[int, tuple] = {}
+        
+        self.completed_speeds: Dict[int, Dict] = {} # {id: {speed: X, direction: Y, ...}}
+        
+        # Track objects currently INSIDE the zone
+        self.objects_in_zone: Set[int] = set()
+        
+        # Store last known positions
         self.last_positions: Dict[int, tuple] = {}
 
-    def set_config(self, line1: List[float], line2: List[float], distance: float):
+    def set_config(self, zone_points: List[float], distance: float):
         """
-        lines as [x1, y1, x2, y2]
+        zone_points as [x1, y1, x2, y2, ...]
         """
-        self.line1 = line1
-        self.line2 = line2
-        self.real_distance = distance
-        print(f"Speed Config Updated: Dist={distance}m")
+        # Convert flat list to list of tuples
+        if zone_points and len(zone_points) >= 6: # At least 3 points
+            pts = []
+            for i in range(0, len(zone_points), 2):
+                pts.append((zone_points[i], zone_points[i+1]))
+            self.zone_polygon = np.array(pts, dtype=np.float32)
+            self.real_distance = distance
+            print(f"Zone Config Updated: {len(pts)} points, Dist={distance}m")
+        else:
+            print("Invalid zone config received")
 
-    def _ccw(self, A, B, C):
-        return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
-
-    def _intersect(self, A, B, C, D):
+    def _get_direction_symbol(self, angle: float) -> str:
         """
-        Return true if line segments AB and CD intersect
+        Returns a unicode arrow symbol based on the angle (0-360).
+        0 deg = East (Right)
+        90 deg = South (Down)
+        180 deg = West (Left)
+        270 deg = North (Up)
         """
-        return self._ccw(A,C,D) != self._ccw(B,C,D) and self._ccw(A,B,C) != self._ccw(A,B,D)
+        if angle >= 337.5 or angle < 22.5:
+            return "⇨"
+        elif 22.5 <= angle < 67.5:
+            return "⬎"
+        elif 67.5 <= angle < 112.5:
+            return "⇩"
+        elif 112.5 <= angle < 157.5:
+            return "⬐"
+        elif 157.5 <= angle < 202.5:
+            return "⇦"
+        elif 202.5 <= angle < 247.5:
+            return "⬏"
+        elif 247.5 <= angle < 292.5:
+            return "⇧"
+        elif 292.5 <= angle < 337.5:
+            return "⬑"
+        return "?"
 
     def update(self, detections: sv.Detections, frame_shape):
         """
-        Update speed estimates.
+        Update zone status and estimations.
         """
-        if self.line1 is None or self.line2 is None:
+        if self.zone_polygon is None:
             return
 
         import time
         height, width = frame_shape[:2]
         current_time = time.time()
         
-        # Convert normalized lines to pixels
-        l1 = [
-            (self.line1[0]*width, self.line1[1]*height),
-            (self.line1[2]*width, self.line1[3]*height)
-        ]
-        l2 = [
-            (self.line2[0]*width, self.line2[1]*height),
-            (self.line2[2]*width, self.line2[3]*height)
-        ]
+        # Scale polygon to pixel coordinates for checking
+        # self.zone_polygon is user config (0-1)
+        # We need integer array for pointPolygonTest? It works with float but for consistency let's scale
+        # actually pointPolygonTest works nicely with float32 if we just pass scaled coordinates
+        
+        zone_pixel = (self.zone_polygon * np.array([width, height], dtype=np.float32)).astype(np.int32)
 
         if detections.tracker_id is None:
             return
@@ -118,56 +147,65 @@ class LineSpeedEstimator:
             y_center = (box[1] + box[3]) / 2
             curr_pos = (x_center, y_center)
             
-            if tracker_id in self.last_positions:
-                prev_pos = self.last_positions[tracker_id]
-                
-                # Check crossing Line 1 (Start)
-                if tracker_id not in self.entry_times:
-                    if self._intersect(prev_pos, curr_pos, l1[0], l1[1]):
-                        self.entry_times[tracker_id] = current_time
-                        # print(f"Object {tracker_id} crossed Line 1 at {current_time}")
+            # Update History (Smoothing)
+            if tracker_id not in self.position_history:
+                self.position_history[tracker_id] = deque(maxlen=30)
+            self.position_history[tracker_id].append(curr_pos)
+            
+            # Check Zone Status
+            # measureDist=False returns +1 (inside), -1 (outside), 0 (on edge)
+            result = cv2.pointPolygonTest(zone_pixel, curr_pos, False)
+            is_inside = result >= 0
+            
+            was_inside = tracker_id in self.objects_in_zone
+            
+            # Event: ENTER Zone
+            if is_inside and not was_inside:
+                self.objects_in_zone.add(tracker_id)
+                self.entry_times[tracker_id] = current_time
+                self.entry_positions[tracker_id] = curr_pos
+                # print(f"Object {tracker_id} ENTERED zone")
 
-                # Check crossing Line 2 (End)
+            # Event: EXIT Zone
+            elif not is_inside and was_inside:
+                self.objects_in_zone.remove(tracker_id)
+                
+                # Check if we have an entry record for this object
                 if tracker_id in self.entry_times:
-                     if self._intersect(prev_pos, curr_pos, l2[0], l2[1]):
-                        start_time = self.entry_times[tracker_id]
-                        time_diff = current_time - start_time
+                    start_time = self.entry_times[tracker_id]
+                    duration = current_time - start_time
+                    
+                    if duration > 0.5: # Minimum duration to avoid flickers
+                        speed_mps = self.real_distance / duration
+                        speed_kmh = speed_mps * 3.6
                         
-                        if time_diff > 0.1: # Eliminate instant/noise crossings
-                            speed_mps = self.real_distance / time_diff
-                            speed_kmh = speed_mps * 3.6
-                            
-                            # Calculate Direction (Angle) from Start Line to End Line
-                            # Vector from entry line center to current
-                            dx = curr_pos[0] - prev_pos[0]
-                            dy = curr_pos[1] - prev_pos[1]
-                            angle = np.degrees(np.arctan2(dy, dx))
-                            if angle < 0: angle += 360
-                            
-                            self.completed_speeds[tracker_id] = {
-                                "speed": speed_kmh,
-                                "direction": angle,
-                                "timestamp": current_time
-                            }
-                            # print(f"Object {tracker_id} Finished! Speed: {speed_kmh:.2f} km/h")
-                            
-                            # Log to DB/Callback could happen here
-                            
-                            # Remove from entry times to prevent double counting
-                            del self.entry_times[tracker_id]
+                        start_pos = self.entry_positions[tracker_id]
+                        end_pos = curr_pos # Exit point
+                        
+                        dx = end_pos[0] - start_pos[0]
+                        dy = end_pos[1] - start_pos[1]
+                        
+                        angle = np.degrees(np.arctan2(dy, dx))
+                        if angle < 0: angle += 360
+                        
+                        self.completed_speeds[tracker_id] = {
+                            "speed": speed_kmh,
+                            "direction": angle,
+                            "direction_symbol": self._get_direction_symbol(angle),
+                            "timestamp": current_time
+                        }
+                        # print(f"Object {tracker_id} EXITED. Speed: {speed_kmh:.1f} km/h, Dir: {angle:.0f}")
 
             self.last_positions[tracker_id] = curr_pos
 
         # Cleanup
-        # Remove old IDs
-        # Keep completed speeds for display? Or clear after some time?
-        # For now, keep them in 'completed_speeds' but maybe limit size
-        
         missing_ids = set(self.last_positions.keys()) - current_ids
         for mid in missing_ids:
-            del self.last_positions[mid]
-            if mid in self.entry_times:
-                del self.entry_times[mid] # Object left before finishing
+            if mid in self.last_positions: del self.last_positions[mid]
+            if mid in self.position_history: del self.position_history[mid]
+            if mid in self.entry_times: del self.entry_times[mid]
+            if mid in self.entry_positions: del self.entry_positions[mid]
+            if mid in self.objects_in_zone: self.objects_in_zone.remove(mid)
 
 class StatsManager:
     """
@@ -217,27 +255,30 @@ class TrafficVisualizer:
         self.label_annotator = sv.LabelAnnotator()
         self.trace_annotator = sv.TraceAnnotator()
 
-    def annotate(self, frame: np.ndarray, detections: sv.Detections, stats: StatsManager, speed_estimator: 'LineSpeedEstimator' = None) -> np.ndarray:
+    def annotate(self, frame: np.ndarray, detections: sv.Detections, stats: StatsManager, speed_estimator: 'PolygonZoneEstimator' = None) -> np.ndarray:
         """
         Draw boxes, labels, traces, stats, and speed.
         """
         annotated_frame = frame.copy()
 
-        # Draw Configured Lines if they exist
-        if speed_estimator and speed_estimator.line1 and speed_estimator.line2:
+        # Draw Configured Zone if it exists
+        if speed_estimator and speed_estimator.zone_polygon is not None:
              height, width = frame.shape[:2]
              
-             # Draw Line 1 (Green)
-             l1_start = (int(speed_estimator.line1[0]*width), int(speed_estimator.line1[1]*height))
-             l1_end = (int(speed_estimator.line1[2]*width), int(speed_estimator.line1[3]*height))
-             cv2.line(annotated_frame, l1_start, l1_end, (0, 255, 0), 2)
-             cv2.putText(annotated_frame, "START", l1_start, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-             # Draw Line 2 (Red)
-             l2_start = (int(speed_estimator.line2[0]*width), int(speed_estimator.line2[1]*height))
-             l2_end = (int(speed_estimator.line2[2]*width), int(speed_estimator.line2[3]*height))
-             cv2.line(annotated_frame, l2_start, l2_end, (0, 0, 255), 2)
-             cv2.putText(annotated_frame, "END", l2_start, cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+             # Scale back to pixels
+             zone_pixel = (speed_estimator.zone_polygon * np.array([width, height], dtype=np.float32)).astype(np.int32)
+             
+             # Reshape for polylines (N, 1, 2)
+             zone_pixel = zone_pixel.reshape((-1, 1, 2))
+             
+             cv2.polylines(annotated_frame, [zone_pixel], True, (0, 255, 0), 2)
+             
+             # Draw Label Center
+             # M = cv2.moments(zone_pixel)
+             # if M["m00"] != 0:
+             #    cX = int(M["m10"] / M["m00"])
+             #    cY = int(M["m01"] / M["m00"])
+             #    cv2.putText(annotated_frame, "ZONE", (cX-20, cY), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
         
         # Draw Traces
         annotated_frame = self.trace_annotator.annotate(
@@ -263,9 +304,10 @@ class TrafficVisualizer:
                 if speed_estimator and tracker_id in speed_estimator.completed_speeds:
                     speed_data = speed_estimator.completed_speeds[tracker_id]
                     speed = speed_data['speed']
-                    label += f" {speed:.1f} km/h"
-                elif speed_estimator and tracker_id in speed_estimator.entry_times:
-                     label += " Measuring..."
+                    symbol = speed_data.get('direction_symbol', '')
+                    label += f" {speed:.1f} km/h {symbol}"
+                elif speed_estimator and tracker_id in speed_estimator.objects_in_zone:
+                     label += " In Zone"
                     
                 labels.append(label)
         else:
