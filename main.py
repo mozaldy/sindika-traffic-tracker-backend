@@ -75,19 +75,34 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         self.visualizer = TrafficVisualizer()
         self.speed_estimator = PolygonZoneEstimator()
         
-        # Load saved config
+        # Load saved config - NEW FORMAT
         config = load_config()
-        if "polygon" in config:
-             self.speed_estimator.set_config(
-                config["polygon"],
-                config.get("distance", 5.0)
-            )
-        elif "line1" in config and "line2" in config:
+        
+        # Store lanes for speed calculation (not polygon-based)
+        self.lanes_config = config.get("lanes", [])
+        if self.lanes_config:
+            logger.info(f"Loaded {len(self.lanes_config)} lanes from config")
+        
+        # Load zones (direction/plate) and use first direction zone for zone-based detection
+        self.zones_config = config.get("zones", [])
+        direction_zones = [z for z in self.zones_config if z.get("type") == "direction"]
+        
+        if direction_zones:
+            # Use first direction zone for PolygonZoneEstimator
+            zone = direction_zones[0]
+            polygon_points = zone.get("polygon", [])
+            if polygon_points:
+                self.speed_estimator.set_config(polygon_points, 5.0)  # Distance not used for direction
+                logger.info(f"Loaded direction zone '{zone.get('name')}' for zone detection")
+        elif self.lanes_config:
+            # Fallback: construct polygon from first lane's lines
+            lane = self.lanes_config[0]
             self.speed_estimator.set_config_lines(
-                config["line1"],
-                config["line2"],
-                config.get("distance", 5.0)
+                lane.get("line_a", []),
+                lane.get("line_b", []),
+                lane.get("distance", 5.0)
             )
+            logger.info("Using lane lines as fallback zone")
 
         self.db = DatabaseManager()
         
@@ -146,8 +161,11 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         # 5. Stats
         self.stats.update(detections)
         
-        # 6. Annotate
-        annotated_frame = self.visualizer.annotate(frame, detections, self.stats, self.speed_estimator, timestamp_info)
+        # 6. Annotate (pass zones and lanes config for visualization)
+        annotated_frame = self.visualizer.annotate(
+            frame, detections, self.stats, self.speed_estimator, timestamp_info,
+            zones_config=self.zones_config, lanes_config=self.lanes_config
+        )
         
         return annotated_frame
 
@@ -337,69 +355,42 @@ async def on_shutdown():
 
 # --- Config Endpoints ---
 
-@app.get("/api/config/lines")
-async def get_config_lines():
+@app.get("/api/config/lanes")
+async def get_config_lanes():
     config = load_config()
-    return config
+    return {"lanes": config.get("lanes", [])}
 
-@app.post("/api/config/lines")
-async def config_lines(request: Request):
-    data = await request.json()
-    
-    # Save to disk (Persistent)
-    save_config(data)
-    
-    polygon = data.get("polygon")
-   
-    distance = data.get("distance", 5.0)
-    
-    # Update all active tracks
-    for pc in pcs:
-        for transceiver in pc.getTransceivers():
-             if transceiver.sender.track and isinstance(transceiver.sender.track, TrafficAnalysisTrack):
-                 track = transceiver.sender.track
-                 if polygon:
-                    # Generic polygon update
-                    track.speed_estimator.set_config(polygon, distance)
-                 else:
-                     # Fallback line update (which maps to polygon)
-                     line1 = data.get("line1")
-                     line2 = data.get("line2")
-                     if line1 and line2:
-                         track.speed_estimator.set_config_lines(line1, line2, distance)
-                         
-                 logger.info("Updated speed config for active track via config/lines.")
-                 
-    return {"status": "updated"}
+@app.get("/api/config/zones")
+async def get_config_zones():
+    config = load_config()
+    return {"zones": config.get("zones", [])}
 
-# Support the config/zone endpoint (Friend's API) but link it to persistence if desired
-# Or just keep it ephemeral? User's legacy code used persistence.
-# Let's make this endpoint ALSO save if we want consistency, but friend's code didn't seem to have save logic.
-# I'll just make it update the active track, but maybe NOT save to `lines` config logic to avoid format clashes unless we unify.
-# User's frontend calls config/lines?
-# If I look at the diffs, `config_zone` endpoint was Friend's work.
-@app.post("/api/config/zone")
-async def config_zone(request: Request):
+@app.post("/api/config/zones")
+async def config_zones(request: Request):
     data = await request.json()
-    # Support both keys for robustness
-    zone = data.get("zone") or data.get("polygon") 
-    distance = data.get("distance", 5.0)
+    zones = data.get("zones", [])
     
-    # Try to save this as 'polygon' in the config for persistence
     current_config = load_config()
-    current_config["polygon"] = zone
-    current_config["distance"] = distance
+    current_config["zones"] = zones
     save_config(current_config)
+    
+    logger.info(f"Updated zones config: {len(zones)} zones saved.")
+    return {"status": "updated", "count": len(zones)}
 
-    for pc in pcs:
-        for transceiver in pc.getTransceivers():
-             if transceiver.sender.track and isinstance(transceiver.sender.track, TrafficAnalysisTrack):
-                 track = transceiver.sender.track
-                 if zone:
-                     track.speed_estimator.set_config(zone, distance)
-                     logger.info("Updated zone config for active track via config/zone.")
-                 
-    return {"status": "updated"}
+@app.post("/api/config/lanes")
+async def config_lanes(request: Request):
+    data = await request.json()
+    
+    current_config = load_config()
+    current_config["lanes"] = data.get("lanes", [])
+    save_config(current_config)
+    
+    lanes = data.get("lanes", [])
+    logger.info(f"Updated lanes config: {len(lanes)} lanes saved.")
+                  
+    return {"status": "updated", "count": len(lanes)}
+
+
 
 # --- Event Management Endpoints ---
 @app.get("/api/events")

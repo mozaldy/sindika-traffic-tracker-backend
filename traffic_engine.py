@@ -3,7 +3,7 @@ import math
 import supervision as sv
 import numpy as np
 from typing import List, Dict, Set, Deque
-from rfdetr import RFDETRMedium
+from rfdetr import RFDETRSmall
 from rfdetr.util.coco_classes import COCO_CLASSES
 from collections import deque
 
@@ -11,8 +11,8 @@ class ObjectDetector:
     def __init__(self, confidence_threshold: float = 0.5, target_classes: List[int] = None):
         self.confidence_threshold = confidence_threshold
         self.target_classes = target_classes
-        print("Loading RF-DETR Medium model...")
-        self.model = RFDETRMedium()
+        print("Loading RF-DETR Small model...")
+        self.model = RFDETRSmall()
         self.model.optimize_for_inference()
         print("Model loaded and optimized.")
 
@@ -106,19 +106,35 @@ class PolygonZoneEstimator:
                 return i
         return None
 
-    def _get_line_direction_symbol(self, entry_idx: int, exit_idx: int) -> str:
+    def _get_direction_from_angle(self, angle_deg: float) -> str:
         """ 
-        Mapping simbol lama yang mencakup arah belok (tikungan).
-        0=Top, 1=Right, 2=Bottom, 3=Left (tergantung urutan penggambaran poligon)
+        Convert movement angle to direction symbol from DRIVER perspective.
+        In screen coordinates: 
+        - 0° = moving right, 90° = moving down (toward camera), 180° = left, 270° = up (away from camera)
+        
+        From driver perspective (facing forward = away from camera = UP):
+        - Moving up (270°) = Forward ⭡
+        - Moving down (90°) = U-turn/Backward ⭣
+        - Moving left (180°) = Turn Left ↰
+        - Moving right (0°) = Turn Right ↱
         """
-        mapping = {
-            (0, 2): "⇩", (2, 0): "⇧", (1, 3): "⇦", (3, 1): "⇨",
-            (0, 1): "↳", (1, 0): "⬑", # Top ke Right, Right ke Top
-            (0, 3): "↲", (3, 0): "⬏", # Top ke Left, Left ke Top
-            (2, 1): "↱", (1, 2): "⬐", # Bottom ke Right, Right ke Bottom
-            (2, 3): "↰", (3, 2): "⬎", # Bottom ke Left, Left ke Bottom
-        }
-        return mapping.get((entry_idx, exit_idx), "?")
+        # Normalize angle to 0-360
+        angle = angle_deg % 360
+        
+        # Driver perspective - forward is UP (around 270° in screen coords)
+        # We rotate by +90° so that "up" (270°) becomes 0° (forward)
+        driver_angle = (angle + 90) % 360
+        
+        # Now: 0° = Forward, 90° = Right, 180° = Back, 270° = Left
+        if 315 <= driver_angle or driver_angle < 45:
+            return "⭡"  # Forward (straight ahead)
+        elif 45 <= driver_angle < 135:
+            return "↱"  # Right turn
+        elif 135 <= driver_angle < 225:
+            return "⭣"  # U-turn / Backward
+        elif 225 <= driver_angle < 315:
+            return "↰"  # Left turn
+        return "?"
 
     def update(self, detections: sv.Detections, frame_shape, timestamp: float):
         if self.zone_polygon is None or detections.tracker_id is None:
@@ -152,22 +168,21 @@ class PolygonZoneEstimator:
                     duration = timestamp - self.entry_times[tracker_id]
                     if duration > 0.3:
                         speed_kmh = (self.real_distance / duration) * 3.6
-                        exit_edge = self._get_crossed_edge(self.last_positions[tracker_id], curr_pos, frame_shape)
-                        entry_edge = self.entry_edges.get(tracker_id)
                         
-                        # Menggunakan mapping simbol belok dari logika lama
-                        symbol = self._get_line_direction_symbol(entry_edge, exit_edge) if entry_edge is not None and exit_edge is not None else "?"
-                        
+                        # Calculate movement angle from entry to exit position
                         entry_pos = self.entry_positions.get(tracker_id)
                         angle = 0.0
                         if entry_pos:
                             dx = curr_pos[0] - entry_pos[0]
                             dy = curr_pos[1] - entry_pos[1]
                             angle = math.degrees(math.atan2(dy, dx)) % 360
+                        
+                        # Get direction symbol from angle (driver perspective)
+                        symbol = self._get_direction_from_angle(angle)
 
                         self.completed_speeds[tracker_id] = {
                             "speed": speed_kmh,
-                            "direction": angle,
+                            "direction": angle,  # Raw screen angle for debugging
                             "direction_symbol": symbol,
                             "timestamp": timestamp,
                             "start_time": self.entry_times.get(tracker_id, 0.0),
@@ -186,19 +201,65 @@ class TrafficVisualizer:
         self.box_annotator = sv.BoxAnnotator()
         self.label_annotator = sv.LabelAnnotator()
 
-    def annotate(self, frame: np.ndarray, detections: sv.Detections, stats, speed_estimator: PolygonZoneEstimator, timestamp_info: str = None) -> np.ndarray:
+    def annotate(self, frame: np.ndarray, detections: sv.Detections, stats, speed_estimator: PolygonZoneEstimator, timestamp_info: str = None, zones_config: List[Dict] = None, lanes_config: List[Dict] = None) -> np.ndarray:
         annotated_frame = frame.copy()
         h, w = frame.shape[:2]
         
-        # Draw Zone & Edge Numbers
-        if speed_estimator.zone_polygon is not None:
-            zone_pixel = (speed_estimator.zone_polygon * np.array([w, h], dtype=np.float32)).astype(np.int32)
-            cv2.polylines(annotated_frame, [zone_pixel.reshape((-1, 1, 2))], True, (0, 255, 0), 2)
-            for i in range(len(zone_pixel)):
-                p1, p2 = zone_pixel[i], zone_pixel[(i + 1) % len(zone_pixel)]
-                mid = (int((p1[0]+p2[0])/2), int((p1[1]+p2[1])/2))
-                cv2.circle(annotated_frame, mid, 12, (0, 0, 0), -1)
-                cv2.putText(annotated_frame, str(i+1), (mid[0]-6, mid[1]+6), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        # Draw Configured Zones from config (Direction=Green, Plate=Blue)
+        if zones_config:
+            for zone in zones_config:
+                polygon = zone.get("polygon", [])
+                if len(polygon) >= 6:
+                    # Convert normalized to pixels
+                    pts = []
+                    for i in range(0, len(polygon), 2):
+                        pts.append([int(polygon[i] * w), int(polygon[i+1] * h)])
+                    pts = np.array(pts, dtype=np.int32)
+                    
+                    # Color based on type
+                    zone_type = zone.get("type", "direction")
+                    if zone_type == "plate":
+                        color = (255, 100, 0)  # Blue (BGR)
+                    else:
+                        color = (0, 255, 0)  # Green (BGR)
+                    
+                    cv2.polylines(annotated_frame, [pts.reshape((-1, 1, 2))], True, color, 2)
+                    
+                    # Draw zone name
+                    center = pts.mean(axis=0).astype(int)
+                    cv2.putText(annotated_frame, zone.get("name", "Zone"), (center[0]-40, center[1]), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                    
+                    # Draw edge numbers for direction zones
+                    if zone_type == "direction":
+                        for i in range(len(pts)):
+                            p1, p2 = pts[i], pts[(i + 1) % len(pts)]
+                            mid = (int((p1[0]+p2[0])/2), int((p1[1]+p2[1])/2))
+                            cv2.circle(annotated_frame, mid, 12, (0, 0, 0), -1)
+                            cv2.putText(annotated_frame, str(i+1), (mid[0]-6, mid[1]+6), 
+                                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+        
+        # Draw Configured Lanes (cyan lines)
+        if lanes_config:
+            for lane in lanes_config:
+                line_a = lane.get("line_a", [])
+                line_b = lane.get("line_b", [])
+                
+                if len(line_a) >= 4:
+                    p1 = (int(line_a[0] * w), int(line_a[1] * h))
+                    p2 = (int(line_a[2] * w), int(line_a[3] * h))
+                    cv2.line(annotated_frame, p1, p2, (255, 255, 0), 2)  # Cyan
+                    cv2.putText(annotated_frame, f"{lane.get('name', 'Lane')} A", 
+                               ((p1[0]+p2[0])//2, (p1[1]+p2[1])//2), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                
+                if len(line_b) >= 4:
+                    p1 = (int(line_b[0] * w), int(line_b[1] * h))
+                    p2 = (int(line_b[2] * w), int(line_b[3] * h))
+                    cv2.line(annotated_frame, p1, p2, (255, 255, 0), 2)  # Cyan
+                    cv2.putText(annotated_frame, f"{lane.get('name', 'Lane')} B", 
+                               ((p1[0]+p2[0])//2, (p1[1]+p2[1])//2), 
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
         # Draw Trails
         for tid, trail in speed_estimator.active_trails.items():
