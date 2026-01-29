@@ -1,228 +1,61 @@
+"""
+Traffic Detection Server
+========================
 
-import argparse
-import asyncio
+FastAPI application for real-time traffic analysis.
+This server integrates the modular backend components:
+- API Routes (Config, Videos, Events)
+- WebRTC Streaming (TrafficAnalysisTrack)
+- Logic Engine (Turn, Speed, Plate Detection)
+"""
+
+import os
 import json
 import logging
-import os
-import cv2
-import platform
-import shutil
-from typing import List, Optional
+import asyncio
+from typing import Dict, Set
 
-
-from aiortc import RTCPeerConnection, RTCSessionDescription, VideoStreamTrack
-from aiortc.contrib.media import MediaRelay
-from av import VideoFrame
-
-from fastapi import FastAPI, Request, File, UploadFile, Response
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+from aiortc import RTCPeerConnection, RTCSessionDescription
 
-# Import our custom CV engine
-from traffic_engine import ObjectDetector, ObjectTracker, StatsManager, TrafficVisualizer, PolygonZoneEstimator, COCO_CLASSES
-from db_manager import DatabaseManager
+from config import ConfigManager
+from api.routes import create_config_router, create_video_router, create_events_router
+from api.streaming import TrafficAnalysisTrack
+from db import DatabaseManager
 
-# Configure Logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("traffic_server")
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("server")
 
+# Paths
 ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-
-# --- Config Persistence ---
 CONFIG_FILE = os.path.join(ROOT_DIR, "config.json")
+VIDEOS_DIR = os.path.join(ROOT_DIR, "videos")
+CAPTURES_DIR = os.path.join(ROOT_DIR, "captures")
 
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
-    return {}
+# Ensure directories exist
+os.makedirs(VIDEOS_DIR, exist_ok=True)
+os.makedirs(CAPTURES_DIR, exist_ok=True)
 
-def save_config(config):
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(config, f)
+# Initialize resources
+config_manager = ConfigManager(CONFIG_FILE)
+db_manager = DatabaseManager()
+pcs: Set[RTCPeerConnection] = set()
 
-class TrafficAnalysisTrack(VideoStreamTrack):
-    """
-    A WebRTC VideoStreamTrack that reads frames from a source (file/camera),
-    runs the traffic analysis pipeline, and yields the annotated frame.
-    """
-    def __init__(self, source_path: str, target_classes: List[str] = None):
-        super().__init__()
-        self.source_path = source_path
-        
-        # Initialize CV Components
-        logger.info(f"Initializing Traffic Analysis Engine for source: {source_path}")
-        
-        # Map target classes to IDs
-        target_ids = None
-        if target_classes:
-            target_ids = []
-            name_to_id = {v: k for k, v in COCO_CLASSES.items()}
-            for name in target_classes:
-                if name in name_to_id:
-                    target_ids.append(name_to_id[name])
-                else:
-                    logger.warning(f"Class '{name}' not found.")
-        
-        self.detector = ObjectDetector(confidence_threshold=0.5, target_classes=target_ids)
-        self.tracker = ObjectTracker()
-        self.stats = StatsManager()
-        self.visualizer = TrafficVisualizer()
-        self.speed_estimator = PolygonZoneEstimator()
-        
-        # Load saved config - NEW FORMAT
-        config = load_config()
-        
-        # Store lanes for speed calculation (not polygon-based)
-        self.lanes_config = config.get("lanes", [])
-        if self.lanes_config:
-            logger.info(f"Loaded {len(self.lanes_config)} lanes from config")
-        
-        # Load zones (direction/plate) and use first direction zone for zone-based detection
-        self.zones_config = config.get("zones", [])
-        direction_zones = [z for z in self.zones_config if z.get("type") == "direction"]
-        
-        if direction_zones:
-            # Use first direction zone for PolygonZoneEstimator
-            zone = direction_zones[0]
-            polygon_points = zone.get("polygon", [])
-            if polygon_points:
-                self.speed_estimator.set_config(polygon_points, 5.0)  # Distance not used for direction
-                logger.info(f"Loaded direction zone '{zone.get('name')}' for zone detection")
-        elif self.lanes_config:
-            # Fallback: construct polygon from first lane's lines
-            lane = self.lanes_config[0]
-            self.speed_estimator.set_config_lines(
-                lane.get("line_a", []),
-                lane.get("line_b", []),
-                lane.get("distance", 5.0)
-            )
-            logger.info("Using lane lines as fallback zone")
+# Initialize API routers
+config_router = create_config_router(config_manager)
+video_router = create_video_router(VIDEOS_DIR)
+event_router = create_events_router(db_manager)
 
-        self.db = DatabaseManager()
-        
-        # Video Capture
-        self.cap = cv2.VideoCapture(self.source_path)
-        if not self.cap.isOpened():
-            logger.error(f"Failed to open video source: {self.source_path}")
-            
-        self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
-        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.duration_sec = self.total_frames / self.fps if self.fps > 0 else 0
+# Setup FastAPI
+app = FastAPI(title="Traffic Detection Server")
 
-        self.loop = asyncio.get_event_loop()
-        
-    def _format_time(self, seconds):
-        mins = int(seconds // 60)
-        secs = int(seconds % 60)
-        return f"{mins:02d}:{secs:02d}"
-
-    def _process_frame(self, frame, timestamp_info, timestamp_sec):
-        """
-        Sync function to run the CV pipeline.
-        """
-        # Run Analysis Pipeline
-        # 1. Detect
-        detections = self.detector.detect(frame)
-        
-        # 2. Track
-        detections = self.tracker.update(detections)
-        
-        # 3. Speed
-        self.speed_estimator.update(detections, frame.shape, timestamp_sec)
-        
-        # 4. Check for completed events and Log
-        # We iterate over detections to match ID with completed events
-        if detections.tracker_id is not None:
-             for xyxy, class_id, tracker_id in zip(detections.xyxy, detections.class_id, detections.tracker_id):
-                 if tracker_id in self.speed_estimator.completed_speeds:
-                     event = self.speed_estimator.completed_speeds[tracker_id]
-                     
-                     if not event.get("logged", False):
-                         class_name = COCO_CLASSES[class_id]
-                         self.db.log_event(
-                             frame=frame,
-                             bbox=xyxy,
-                             class_name=class_name,
-                             speed=event['speed'],
-                             direction=event['direction'], # Relative Angle
-                             direction_symbol=event.get('direction_symbol'),
-                             video_source=os.path.basename(self.source_path),
-                             crossing_start=event.get('start_time', 0.0),
-                             crossing_end=event.get('end_time', 0.0)
-                         )
-                         event["logged"] = True
-
-        # 5. Stats
-        self.stats.update(detections)
-        
-        # 6. Annotate (pass zones and lanes config for visualization)
-        annotated_frame = self.visualizer.annotate(
-            frame, detections, self.stats, self.speed_estimator, timestamp_info,
-            zones_config=self.zones_config, lanes_config=self.lanes_config
-        )
-        
-        return annotated_frame
-
-    async def recv(self):
-        """
-        The core loop. Called when the client requests a frame.
-        """
-        pts, time_base = await self.next_timestamp()
-        
-        # Read frame from OpenCV
-        ret, frame = self.cap.read()
-        if not ret:
-            # Loop video: Re-open the file to handle different codecs/containers
-            logger.info("Video finished, looping (re-opening file)...")
-            self.cap.release()
-            
-            self.cap = cv2.VideoCapture(self.source_path)
-            
-            # Additional check if re-open succeeded
-            if not self.cap.isOpened():
-                logger.error(f"Failed to re-open video source: {self.source_path}")
-                return None
-
-            ret, frame = self.cap.read()
-            if not ret:
-                # If still failing, return a black frame or error
-                logger.error("Could not read frame even after re-opening.")
-                return None # This might close the track
-
-        # Calculate Timestamp Info
-        current_frame_pos = self.cap.get(cv2.CAP_PROP_POS_FRAMES)
-        current_sec = current_frame_pos / self.fps if self.fps > 0 else 0
-        timestamp_str = f"{self._format_time(current_sec)} / {self._format_time(self.duration_sec)}"
-
-        # Run CV Pipeline in a separate thread to ensure we don't block the AsyncIO loop (which handles WebRTC heartbeats)
-        annotated_frame = await self.loop.run_in_executor(None, self._process_frame, frame, timestamp_str, current_sec)
-        
-        if annotated_frame is None: 
-             return None
-
-        # Convert to WebRTC Frame (AV)
-        # OpenCV is BGR, av.VideoFrame.from_ndarray expects BGR if format='bgr24'
-        new_frame = VideoFrame.from_ndarray(annotated_frame, format="bgr24")
-        new_frame.pts = pts
-        new_frame.time_base = time_base
-        
-        return new_frame
-
-    def stop(self):
-        if self.cap.isOpened():
-            self.cap.release()
-        super().stop()
-
-
-# --- FastAPI App ---
-app = FastAPI()
-
+# Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -231,89 +64,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount static files (for index.html)
-if not os.path.exists(os.path.join(ROOT_DIR, "static")):
-    os.makedirs(os.path.join(ROOT_DIR, "static"))
-    
-app.mount("/static", StaticFiles(directory=os.path.join(ROOT_DIR, "static")), name="static")
+# Mount Routers
+app.include_router(config_router)
+app.include_router(video_router)
+app.include_router(event_router)
 
-# Store active peer connections to close them on shutdown
-pcs = set()
+# Mount Static Files (Frontend)
+static_dir = os.path.join(ROOT_DIR, "static")
+if not os.path.exists(static_dir):
+    os.makedirs(static_dir)
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
-@app.get("/", response_class=HTMLResponse)
-async def read_root():
-    return open(os.path.join(ROOT_DIR, "static/index.html")).read()
-
-# --- Video Management ---
-VIDEO_DIR = os.path.join(ROOT_DIR, "videos")
-if not os.path.exists(VIDEO_DIR):
-    os.makedirs(VIDEO_DIR)
-
-@app.post("/api/upload")
-async def upload_video(file: UploadFile = File(...)):
-    try:
-        file_path = os.path.join(VIDEO_DIR, file.filename)
-        with open(file_path, "wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        logger.info(f"Uploaded video: {file.filename}")
-        return {"filename": file.filename, "status": "success"}
-    except Exception as e:
-        logger.error(f"Upload failed: {e}")
-        return JSONResponse(status_code=500, content={"message": str(e)})
-
-@app.get("/api/videos")
-async def list_videos():
-    files = []
-        
-    if os.path.exists(VIDEO_DIR):
-        for f in os.listdir(VIDEO_DIR):
-            if f.endswith(('.mp4', '.avi', '.mov')):
-                files.append(f)
-    return {"videos": sorted(list(set(files)))}
-
-@app.get("/api/video_preview")
-async def video_preview(video_source: str):
-    if not video_source:
-        return Response(status_code=400)
-        
-    # Resolve path consistent with other endpoints
-    # 1. Check if absolute or direct relative path exists
-    if os.path.exists(video_source):
-        path = video_source
-    else:
-        # 2. Check in VIDEO_DIR
-        path = os.path.join(VIDEO_DIR, video_source)
-        if not os.path.exists(path):
-             return Response(status_code=404, content="Video not found")
-
-    cap = cv2.VideoCapture(path)
-    if not cap.isOpened():
-         return Response(status_code=500, content="Could not open video")
-    
-    ret, frame = cap.read()
-    cap.release()
-    
-    if ret:
-        success, buffer = cv2.imencode('.jpg', frame)
-        if success:
-            return Response(content=buffer.tobytes(), media_type="image/jpeg")
-            
-    return Response(status_code=500, content="Could not read frame")
+@app.get("/")
+def read_root():
+    return {"status": "online", "service": "traffic-tracker"}
 
 @app.post("/api/offer")
 async def offer(request: Request):
+    """WebRTC offer endpoint."""
     params = await request.json()
-    sdp = params["sdp"]
-    type_ = params["type"]
-    video_source_name = params.get("video_source")
-    target_classes = params.get("target_classes", ["person", "car", "motorcycle", "truck", "bus"])
-
-    offer = RTCSessionDescription(sdp=sdp, type=type_)
+    off = RTCSessionDescription(sdp=params["sdp"], type=params["type"])
+    
+    # Get configuration from request
+    video_source = params.get("video_source", "test_video.mp4")
+    video_path = os.path.join(VIDEOS_DIR, video_source)
     
     pc = RTCPeerConnection()
     pcs.add(pc)
     
-    logger.info(f"Created new PeerConnection. Selected Source: {video_source_name}, Classes: {target_classes}")
+    # Determine target classes (if any)
+    target_classes = params.get("target_classes")
+    
+    # Create Analysis Track
+    track = TrafficAnalysisTrack(
+        source_path=video_path,
+        config_manager=config_manager,
+        target_classes=target_classes
+    )
+    
+    pc.addTrack(track)
     
     @pc.on("connectionstatechange")
     async def on_connectionstatechange():
@@ -321,104 +110,27 @@ async def offer(request: Request):
         if pc.connectionState == "failed":
             await pc.close()
             pcs.discard(pc)
-    
-    # Determine absolute path for video source
-    if not video_source_name:
-        return JSONResponse(status_code=400, content={"message": "No video source selected. Please upload a video."})
+            track.stop()
+        elif pc.connectionState == "closed":
+            pcs.discard(pc)
+            track.stop()
 
-    video_path = os.path.join(VIDEO_DIR, video_source_name)
-        
-    if not os.path.exists(video_path):
-         logger.error(f"Source {video_path} not found.")
-         return JSONResponse(status_code=404, content={"message": f"Video '{video_source_name}' not found. Please upload it."})
-    
-    video_track = TrafficAnalysisTrack(video_path, target_classes)
-    
-    pc.addTrack(video_track)
-
-    await pc.setRemoteDescription(offer)
-    
+    await pc.setRemoteDescription(off)
     answer = await pc.createAnswer()
     await pc.setLocalDescription(answer)
     
-    return JSONResponse(content={
+    return {
         "sdp": pc.localDescription.sdp,
         "type": pc.localDescription.type
-    })
+    }
 
 @app.on_event("shutdown")
-async def on_shutdown():
-    logger.info("Shutting down... closing peer connections.")
+async def shutdown_event():
+    logger.info("Server shutting down, closing connections...")
     coros = [pc.close() for pc in pcs]
     await asyncio.gather(*coros)
     pcs.clear()
 
-# --- Config Endpoints ---
-
-@app.get("/api/config/lanes")
-async def get_config_lanes():
-    config = load_config()
-    return {"lanes": config.get("lanes", [])}
-
-@app.get("/api/config/zones")
-async def get_config_zones():
-    config = load_config()
-    return {"zones": config.get("zones", [])}
-
-@app.post("/api/config/zones")
-async def config_zones(request: Request):
-    data = await request.json()
-    zones = data.get("zones", [])
-    
-    current_config = load_config()
-    current_config["zones"] = zones
-    save_config(current_config)
-    
-    logger.info(f"Updated zones config: {len(zones)} zones saved.")
-    return {"status": "updated", "count": len(zones)}
-
-@app.post("/api/config/lanes")
-async def config_lanes(request: Request):
-    data = await request.json()
-    
-    current_config = load_config()
-    current_config["lanes"] = data.get("lanes", [])
-    save_config(current_config)
-    
-    lanes = data.get("lanes", [])
-    logger.info(f"Updated lanes config: {len(lanes)} lanes saved.")
-                  
-    return {"status": "updated", "count": len(lanes)}
-
-
-
-# --- Event Management Endpoints ---
-@app.get("/api/events")
-async def get_events(limit: int = 100, offset: int = 0):
-    db = DatabaseManager()
-    events = db.get_events(limit, offset)
-    return {"events": events}
-
-@app.delete("/api/events/{event_id}")
-async def delete_event(event_id: int):
-    db = DatabaseManager()
-    success = db.delete_event(event_id)
-    if success:
-        return {"status": "deleted", "id": event_id}
-    return JSONResponse(status_code=404, content={"message": "Event not found"})
-
-@app.delete("/api/events")
-async def delete_all_events():
-    db = DatabaseManager()
-    success = db.delete_all_events()
-    if success:
-        return {"status": "cleared"}
-    return JSONResponse(status_code=500, content={"message": "Failed to clear events"})
-
-# Mount captures directory to serve images
-if not os.path.exists(os.path.join(ROOT_DIR, "captures")):
-    os.makedirs(os.path.join(ROOT_DIR, "captures"))
-app.mount("/captures", StaticFiles(directory=os.path.join(ROOT_DIR, "captures")), name="captures")
-
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

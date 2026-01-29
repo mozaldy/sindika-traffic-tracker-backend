@@ -51,3 +51,4 @@ traffic_data.db
 # Local specific
 videos/
 static/
+_backup/
