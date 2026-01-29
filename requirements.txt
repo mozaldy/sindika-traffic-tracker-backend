@@ -7,3 +7,4 @@ supervision
 numpy
 python-multipart
 requests
+open-image-models[onnx]

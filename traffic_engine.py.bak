@@ -1,0 +1,376 @@
+import cv2
+import math
+import supervision as sv
+import numpy as np
+from typing import List, Dict, Set, Deque, Tuple, Optional
+from rfdetr import RFDETRMedium
+from rfdetr.util.coco_classes import COCO_CLASSES
+from collections import deque
+import logging
+
+logger = logging.getLogger("traffic_engine")
+
+
+class LicensePlateReader:
+    """
+    License plate detection and OCR reader.
+    Uses open-image-models for plate detection and EasyOCR for text reading.
+    Lazy-loads models on first use to avoid slowing down startup.
+    """
+    def __init__(self, detection_model: str = "yolo-v9-t-384-license-plate-end2end"):
+        self.detection_model_name = detection_model
+        self._detector = None
+        self._ocr_reader = None
+        logger.info(f"LicensePlateReader initialized (lazy load). Model: {detection_model}")
+
+    def _ensure_loaded(self):
+        """Lazy load models on first use."""
+        if self._detector is None:
+            try:
+                from open_image_models import LicensePlateDetector
+                logger.info("Loading license plate detection model...")
+                self._detector = LicensePlateDetector(detection_model=self.detection_model_name)
+                logger.info("License plate detector loaded successfully.")
+            except Exception as e:
+                logger.error(f"Failed to load LicensePlateDetector: {e}")
+                self._detector = False  # Mark as failed
+        
+        if self._ocr_reader is None:
+            try:
+                import easyocr
+                logger.info("Loading EasyOCR model...")
+                self._ocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
+                logger.info("EasyOCR reader loaded successfully.")
+            except Exception as e:
+                logger.error(f"Failed to load EasyOCR: {e}")
+                self._ocr_reader = False  # Mark as failed
+
+    def detect_and_read(self, vehicle_crop: np.ndarray) -> Tuple[Optional[str], Optional[np.ndarray]]:
+        """
+        Detect license plate in vehicle crop and read text via OCR.
+        
+        Args:
+            vehicle_crop: Cropped image of the vehicle (BGR format)
+            
+        Returns:
+            Tuple of (plate_text, plate_crop) or (None, None) if no plate found
+        """
+        self._ensure_loaded()
+        
+        if self._detector is False or vehicle_crop is None or vehicle_crop.size == 0:
+            return None, None
+        
+        try:
+            # Detect license plates in the vehicle crop
+            detections = self._detector.predict(vehicle_crop)
+            
+            if not detections or len(detections) == 0:
+                return None, None
+            
+            # Take the first (best confidence) detection
+            # Detections from open-image-models come as DetectionResult objects
+            best_detection = detections[0]
+            x1, y1, x2, y2 = int(best_detection.bounding_box.x1), int(best_detection.bounding_box.y1), \
+                              int(best_detection.bounding_box.x2), int(best_detection.bounding_box.y2)
+            
+            # Clamp to image bounds
+            h, w = vehicle_crop.shape[:2]
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(w, x2), min(h, y2)
+            
+            if x2 <= x1 or y2 <= y1:
+                return None, None
+            
+            plate_crop = vehicle_crop[y1:y2, x1:x2].copy()
+            
+            # Run OCR on the plate crop
+            plate_text = None
+            if self._ocr_reader and self._ocr_reader is not False:
+                try:
+                    # Convert BGR to RGB for EasyOCR
+                    plate_rgb = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2RGB)
+                    results = self._ocr_reader.readtext(plate_rgb, detail=0)
+                    if results:
+                        # Join all detected text segments
+                        plate_text = " ".join(results).strip().upper()
+                        if plate_text:
+                            logger.info(f"Detected plate text: {plate_text}")
+                except Exception as e:
+                    logger.warning(f"OCR failed: {e}")
+            
+            return plate_text, plate_crop
+            
+        except Exception as e:
+            logger.error(f"License plate detection failed: {e}")
+            return None, None
+
+class ObjectDetector:
+    def __init__(self, confidence_threshold: float = 0.5, target_classes: List[int] = None):
+        self.confidence_threshold = confidence_threshold
+        self.target_classes = target_classes
+        print("Loading RF-DETR Medium model...")
+        self.model = RFDETRMedium()
+        self.model.optimize_for_inference()
+        print("Model loaded and optimized.")
+
+    def detect(self, frame: np.ndarray) -> sv.Detections:
+        frame_rgb = frame[:, :, ::-1].copy()
+        detections = self.model.predict(frame_rgb, threshold=self.confidence_threshold)
+        if self.target_classes is not None:
+            detections = detections[np.isin(detections.class_id, self.target_classes)]
+        return detections
+
+class ObjectTracker:
+    def __init__(self):
+        self.tracker = sv.ByteTrack()
+
+    def update(self, detections: sv.Detections) -> sv.Detections:
+        return self.tracker.update_with_detections(detections)
+
+class StatsManager:
+    def __init__(self):
+        self.unique_object_ids: Dict[str, Set[int]] = {}
+        self.current_counts: Dict[str, int] = {}
+
+    def update(self, detections: sv.Detections):
+        self.current_counts = {}
+        if detections.tracker_id is None:
+            return
+        for class_id, tracker_id in zip(detections.class_id, detections.tracker_id):
+            class_name = COCO_CLASSES[class_id]
+            if class_name not in self.unique_object_ids:
+                self.unique_object_ids[class_name] = set()
+            self.unique_object_ids[class_name].add(tracker_id)
+            self.current_counts[class_name] = self.current_counts.get(class_name, 0) + 1
+
+    def get_total_counts(self) -> Dict[str, int]:
+        return {k: len(v) for k, v in self.unique_object_ids.items()}
+
+    def get_current_counts(self) -> Dict[str, int]:
+        return self.current_counts
+
+class MultiLaneSpeedEstimator:
+    """
+    Multi-lane speed estimator using two-line pairs per lane.
+    Each lane has an entry line, exit line, and known distance between them.
+    Speed = distance / time_to_cross
+    """
+    def __init__(self):
+        self.lanes: List[Dict] = []  # List of lane configs
+        self.last_positions: Dict[int, tuple] = {}
+        self.active_trails: Dict[int, List[tuple]] = {}
+        
+        # Per-object tracking: which lane's line A they crossed and when
+        self.line_a_crossings: Dict[int, Dict] = {}  # tracker_id -> {lane_idx, timestamp, position}
+        
+        # Completed speed events
+        self.completed_speeds: Dict[int, Dict] = {}
+        
+        # Objects currently between lines (crossed A but not B)
+        self.objects_in_lanes: Dict[int, int] = {}  # tracker_id -> lane_idx
+
+    def set_config(self, lanes: List[Dict]):
+        """
+        Set lane configurations.
+        Each lane dict should have:
+        - name: str
+        - line_a: [x1, y1, x2, y2] (normalized 0-1)
+        - line_b: [x1, y1, x2, y2] (normalized 0-1)  
+        - distance: float (meters between line_a and line_b)
+        """
+        self.lanes = lanes
+        logger.info(f"Configured {len(lanes)} lanes for speed detection")
+        for i, lane in enumerate(lanes):
+            logger.info(f"  Lane {i}: {lane.get('name', f'Lane {i+1}')} - {lane.get('distance', 5)}m")
+
+    def _ccw(self, A, B, C):
+        """Counter-clockwise test for line intersection."""
+        return (C[1]-A[1]) * (B[0]-A[0]) > (B[1]-A[1]) * (C[0]-A[0])
+
+    def _segments_intersect(self, A, B, C, D):
+        """Check if segment AB intersects segment CD."""
+        return self._ccw(A,C,D) != self._ccw(B,C,D) and self._ccw(A,B,C) != self._ccw(A,B,D)
+
+    def _check_line_crossing(self, prev_pos: tuple, curr_pos: tuple, line: List[float], frame_shape) -> bool:
+        """Check if movement from prev_pos to curr_pos crosses the given line."""
+        if not line or len(line) != 4:
+            return False
+        h, w = frame_shape[:2]
+        # Convert normalized line coords to pixel coords
+        lx1, ly1, lx2, ly2 = line[0]*w, line[1]*h, line[2]*w, line[3]*h
+        return self._segments_intersect(prev_pos, curr_pos, (lx1, ly1), (lx2, ly2))
+
+    def _get_direction_symbol(self, lane_name: str, is_reverse: bool = False) -> str:
+        """Generate a direction symbol based on lane name and direction."""
+        name_lower = lane_name.lower()
+        if 'north' in name_lower: return '⇩' if is_reverse else '⇧'
+        if 'south' in name_lower: return '⇧' if is_reverse else '⇩'
+        if 'east' in name_lower: return '⇦' if is_reverse else '⇨'
+        if 'west' in name_lower: return '⇨' if is_reverse else '⇦'
+        return '←' if is_reverse else '→'
+
+    def update(self, detections: sv.Detections, frame_shape, timestamp: float):
+        """Update speed estimation with new detections."""
+        if not self.lanes or detections.tracker_id is None:
+            return
+            
+        current_ids = set()
+        
+        for tracker_id, box in zip(detections.tracker_id, detections.xyxy):
+            current_ids.add(tracker_id)
+            curr_pos = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+            
+            # Track trail
+            if tracker_id not in self.active_trails:
+                self.active_trails[tracker_id] = []
+            self.active_trails[tracker_id].append(curr_pos)
+            
+            # Skip if no previous position
+            if tracker_id not in self.last_positions:
+                self.last_positions[tracker_id] = curr_pos
+                continue
+            
+            prev_pos = self.last_positions[tracker_id]
+            
+            # Check each lane for line crossings (bidirectional: A→B or B→A)
+            for lane_idx, lane in enumerate(self.lanes):
+                line_a = lane.get('line_a')
+                line_b = lane.get('line_b')
+                distance = lane.get('distance', 5.0)
+                lane_name = lane.get('name', f'Lane {lane_idx + 1}')
+                
+                # If not currently tracking a crossing for this object
+                if tracker_id not in self.line_a_crossings:
+                    # Check if crossing Line A (forward direction entry)
+                    if self._check_line_crossing(prev_pos, curr_pos, line_a, frame_shape):
+                        self.line_a_crossings[tracker_id] = {
+                            'lane_idx': lane_idx,
+                            'timestamp': timestamp,
+                            'position': curr_pos,
+                            'entry_line': 'a',  # Entered via Line A
+                            'exit_line': 'b'    # Should exit via Line B
+                        }
+                        self.objects_in_lanes[tracker_id] = lane_idx
+                        logger.debug(f"Object {tracker_id} crossed Line A of {lane_name} (forward)")
+                    
+                    # Check if crossing Line B (reverse direction entry)
+                    elif self._check_line_crossing(prev_pos, curr_pos, line_b, frame_shape):
+                        self.line_a_crossings[tracker_id] = {
+                            'lane_idx': lane_idx,
+                            'timestamp': timestamp,
+                            'position': curr_pos,
+                            'entry_line': 'b',  # Entered via Line B
+                            'exit_line': 'a'    # Should exit via Line A
+                        }
+                        self.objects_in_lanes[tracker_id] = lane_idx
+                        logger.debug(f"Object {tracker_id} crossed Line B of {lane_name} (reverse)")
+                
+                # Check if crossing the exit line
+                elif tracker_id in self.line_a_crossings:
+                    entry_info = self.line_a_crossings[tracker_id]
+                    if entry_info['lane_idx'] == lane_idx:
+                        # Determine which line to check for exit
+                        exit_line = line_b if entry_info['exit_line'] == 'b' else line_a
+                        is_reverse = entry_info['entry_line'] == 'b'
+                        
+                        if self._check_line_crossing(prev_pos, curr_pos, exit_line, frame_shape):
+                            # Calculate speed
+                            duration = timestamp - entry_info['timestamp']
+                            if duration > 0.1:  # Minimum 0.1 second crossing
+                                speed_kmh = (distance / duration) * 3.6
+                                
+                                # Calculate direction angle
+                                entry_pos = entry_info['position']
+                                dx = curr_pos[0] - entry_pos[0]
+                                dy = curr_pos[1] - entry_pos[1]
+                                angle = math.degrees(math.atan2(dy, dx)) % 360
+                                
+                                # Display name with direction indicator
+                                display_name = f"{lane_name} (Rev)" if is_reverse else lane_name
+                                
+                                self.completed_speeds[tracker_id] = {
+                                    "speed": speed_kmh,
+                                    "direction": angle,
+                                    "direction_symbol": self._get_direction_symbol(lane_name, is_reverse),
+                                    "lane_name": display_name,
+                                    "timestamp": timestamp,
+                                    "start_time": entry_info['timestamp'],
+                                    "end_time": timestamp
+                                }
+                                logger.info(f"Object {tracker_id} completed {display_name}: {speed_kmh:.1f} km/h")
+                            
+                            # Clear entry tracking
+                            del self.line_a_crossings[tracker_id]
+                            if tracker_id in self.objects_in_lanes:
+                                del self.objects_in_lanes[tracker_id]
+            
+            self.last_positions[tracker_id] = curr_pos
+        
+        # Cleanup old tracked objects
+        for tid in list(self.last_positions.keys() - current_ids):
+            for d in [self.last_positions, self.line_a_crossings, self.objects_in_lanes, self.active_trails]:
+                if tid in d: 
+                    del d[tid]
+
+class TrafficVisualizer:
+    def __init__(self):
+        self.box_annotator = sv.BoxAnnotator()
+        self.label_annotator = sv.LabelAnnotator()
+
+    def annotate(self, frame: np.ndarray, detections: sv.Detections, stats, speed_estimator: MultiLaneSpeedEstimator, timestamp_info: str = None) -> np.ndarray:
+        annotated_frame = frame.copy()
+        h, w = frame.shape[:2]
+        
+        # Draw Lane Lines
+        for lane_idx, lane in enumerate(speed_estimator.lanes):
+            lane_name = lane.get('name', f'Lane {lane_idx + 1}')
+            line_a = lane.get('line_a')
+            line_b = lane.get('line_b')
+            
+            # Draw Line A (entry) in cyan
+            if line_a and len(line_a) == 4:
+                pt1 = (int(line_a[0] * w), int(line_a[1] * h))
+                pt2 = (int(line_a[2] * w), int(line_a[3] * h))
+                cv2.line(annotated_frame, pt1, pt2, (255, 255, 0), 2)  # Cyan
+                # Label
+                mid = ((pt1[0] + pt2[0]) // 2, (pt1[1] + pt2[1]) // 2)
+                cv2.putText(annotated_frame, f"{lane_name} A", (mid[0] - 20, mid[1] - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+            
+            # Draw Line B (exit) in magenta
+            if line_b and len(line_b) == 4:
+                pt1 = (int(line_b[0] * w), int(line_b[1] * h))
+                pt2 = (int(line_b[2] * w), int(line_b[3] * h))
+                cv2.line(annotated_frame, pt1, pt2, (255, 0, 255), 2)  # Magenta
+                # Label
+                mid = ((pt1[0] + pt2[0]) // 2, (pt1[1] + pt2[1]) // 2)
+                cv2.putText(annotated_frame, f"{lane_name} B", (mid[0] - 20, mid[1] - 5), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+
+        # Draw Trails
+        for tid, trail in speed_estimator.active_trails.items():
+            if len(trail) > 1:
+                color = (0, 255, 0) if tid in speed_estimator.completed_speeds else (0, 255, 255)
+                cv2.polylines(annotated_frame, [np.array(trail, dtype=np.int32)], False, color, 2)
+
+        # Create Labels
+        labels = []
+        if detections.tracker_id is not None:
+            for class_id, tid in zip(detections.class_id, detections.tracker_id):
+                name = COCO_CLASSES[class_id]
+                label = f"#{tid} {name}"
+                if tid in speed_estimator.completed_speeds:
+                    res = speed_estimator.completed_speeds[tid]
+                    lane_name = res.get('lane_name', '')
+                    label += f" {res['speed']:.1f}km/h {res['direction_symbol']}"
+                    if lane_name:
+                        label += f" [{lane_name}]"
+                elif tid in speed_estimator.objects_in_lanes:
+                    lane_idx = speed_estimator.objects_in_lanes[tid]
+                    lane_name = speed_estimator.lanes[lane_idx].get('name', f'Lane {lane_idx+1}') if lane_idx < len(speed_estimator.lanes) else ''
+                    label += f" [Crossing {lane_name}]"
+                labels.append(label)
+
+        annotated_frame = self.box_annotator.annotate(scene=annotated_frame, detections=detections)
+        annotated_frame = self.label_annotator.annotate(scene=annotated_frame, detections=detections, labels=labels)
+        return annotated_frame

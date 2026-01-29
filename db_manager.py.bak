@@ -32,7 +32,9 @@ class DatabaseManager:
                 image_path TEXT,
                 video_source TEXT,
                 crossing_start REAL,
-                crossing_end REAL
+                crossing_end REAL,
+                license_plate TEXT,
+                plate_image_path TEXT
             )
         ''')
         
@@ -59,20 +61,35 @@ class DatabaseManager:
                 c.execute('ALTER TABLE traffic_events ADD COLUMN crossing_end REAL')
             except sqlite3.OperationalError:
                 pass
+
+        # Migration 3: License Plate
+        if 'license_plate' not in existing_columns:
+            try:
+                c.execute('ALTER TABLE traffic_events ADD COLUMN license_plate TEXT')
+            except sqlite3.OperationalError:
+                pass
+        
+        if 'plate_image_path' not in existing_columns:
+            try:
+                c.execute('ALTER TABLE traffic_events ADD COLUMN plate_image_path TEXT')
+            except sqlite3.OperationalError:
+                pass
             
         conn.commit()
         conn.close()
 
-    def log_event(self, frame: np.ndarray, bbox: list, class_name: str, speed: float, direction: float, direction_symbol: str = None, video_source="unknown", crossing_start=0.0, crossing_end=0.0):
+    def log_event(self, frame: np.ndarray, bbox: list, class_name: str, speed: float, direction: float, direction_symbol: str = None, video_source="unknown", crossing_start=0.0, crossing_end=0.0, license_plate: str = None, plate_crop: np.ndarray = None):
         """
         Logs an event: Crops image, saves to disk, inserts into DB.
         bbox: [x1, y1, x2, y2]
+        license_plate: OCR text from license plate (if detected)
+        plate_crop: Cropped license plate image (if detected)
         """
         try:
             timestamp = time.time()
             dt_str = datetime.fromtimestamp(timestamp).strftime("%Y%m%d_%H%M%S_%f")
             
-            # Crop Image
+            # Crop Vehicle Image
             h, w = frame.shape[:2]
             x1, y1, x2, y2 = map(int, bbox)
             # Clamp coordinates
@@ -87,13 +104,20 @@ class DatabaseManager:
             else:
                 file_path = "" # Invalid crop
 
+            # Save Plate Crop Image (if available)
+            plate_image_path = ""
+            if plate_crop is not None and plate_crop.size > 0:
+                plate_filename = f"{dt_str}_plate.jpg"
+                plate_image_path = os.path.join(self.captures_dir, plate_filename)
+                cv2.imwrite(plate_image_path, plate_crop)
+
             # Insert into DB
             conn = sqlite3.connect(self.db_path)
             c = conn.cursor()
             c.execute('''
-                INSERT INTO traffic_events (timestamp, class_name, speed_kmh, direction_deg, direction_symbol, image_path, video_source, crossing_start, crossing_end)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (timestamp, class_name, float(speed), float(direction), direction_symbol, file_path, video_source, crossing_start, crossing_end))
+                INSERT INTO traffic_events (timestamp, class_name, speed_kmh, direction_deg, direction_symbol, image_path, video_source, crossing_start, crossing_end, license_plate, plate_image_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (timestamp, class_name, float(speed), float(direction), direction_symbol, file_path, video_source, crossing_start, crossing_end, license_plate, plate_image_path))
             conn.commit()
             conn.close()
             
