@@ -74,6 +74,7 @@ static_dir = os.path.join(ROOT_DIR, "static")
 if not os.path.exists(static_dir):
     os.makedirs(static_dir)
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
+app.mount("/captures", StaticFiles(directory=CAPTURES_DIR), name="captures")
 
 @app.get("/")
 def read_root():

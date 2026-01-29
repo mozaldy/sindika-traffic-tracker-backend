@@ -25,8 +25,6 @@ class CrossingEvent:
 class SpeedResult:
     """Result of a completed speed measurement."""
     speed: float
-    direction: float
-    direction_symbol: str
     lane_name: str
     timestamp: float
     start_time: float
@@ -35,8 +33,6 @@ class SpeedResult:
     def to_dict(self) -> Dict[str, Any]:
         return {
             "speed": self.speed,
-            "direction": self.direction,
-            "direction_symbol": self.direction_symbol,
             "lane_name": self.lane_name,
             "timestamp": self.timestamp,
             "start_time": self.start_time,
@@ -54,15 +50,6 @@ class MultiLaneSpeedEstimator:
     
     Supports bidirectional detection (A→B and B→A).
     """
-    
-    # Direction symbols for cardinal directions
-    DIRECTION_SYMBOLS = {
-        'north': ('⇧', '⇩'),  # (forward, reverse)
-        'south': ('⇩', '⇧'),
-        'east': ('⇨', '⇦'),
-        'west': ('⇦', '⇨'),
-    }
-    DEFAULT_SYMBOL = ('→', '←')
     
     def __init__(self):
         """Initialize the speed estimator."""
@@ -208,17 +195,10 @@ class MultiLaneSpeedEstimator:
             speed_kmh = (distance / duration) * 3.6
             is_reverse = crossing.entry_line == 'b'
             
-            # Calculate direction angle
-            dx = exit_position[0] - crossing.position[0]
-            dy = exit_position[1] - crossing.position[1]
-            angle = math.degrees(math.atan2(dy, dx)) % 360
-            
             display_name = f"{lane_name} (Rev)" if is_reverse else lane_name
             
             result = SpeedResult(
                 speed=speed_kmh,
-                direction=angle,
-                direction_symbol=self._get_direction_symbol(lane_name, is_reverse),
                 lane_name=display_name,
                 timestamp=timestamp,
                 start_time=crossing.timestamp,
@@ -254,16 +234,6 @@ class MultiLaneSpeedEstimator:
             return (R[1] - P[1]) * (Q[0] - P[0]) > (Q[1] - P[1]) * (R[0] - P[0])
         
         return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
-
-    def _get_direction_symbol(self, lane_name: str, is_reverse: bool = False) -> str:
-        """Get direction symbol based on lane name."""
-        name_lower = lane_name.lower()
-        
-        for direction, symbols in self.DIRECTION_SYMBOLS.items():
-            if direction in name_lower:
-                return symbols[1] if is_reverse else symbols[0]
-        
-        return self.DEFAULT_SYMBOL[1] if is_reverse else self.DEFAULT_SYMBOL[0]
 
     def _cleanup_stale_objects(self, current_ids: Set[int]) -> None:
         """Remove tracking data for objects no longer visible."""

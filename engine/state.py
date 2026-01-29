@@ -47,6 +47,7 @@ class VehicleState:
     # Plate module data
     plate_captured: bool = False
     plate_image_path: Optional[str] = None
+    vehicle_image_path: Optional[str] = None
     plate_text: Optional[str] = None
     
     # Logging flag
@@ -186,14 +187,14 @@ class VehicleStateManager:
     
     def get_completed_unlogged(self) -> List[VehicleState]:
         """
-        Get all completed vehicles that haven't been logged yet.
+        Get all completed vehicles that haven't been logged and are stale (left frame).
         
         Returns:
             List of VehicleState objects pending logging
         """
         return [
-            v for v in self.completed_vehicles.values() 
-            if not v.logged
+            v for tid, v in self.completed_vehicles.items()
+            if not v.logged and tid not in self.vehicles
         ]
     
     def mark_logged(self, track_id: int) -> None:

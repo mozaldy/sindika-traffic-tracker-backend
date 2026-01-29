@@ -37,12 +37,14 @@ class TrafficVisualizer:
     TRAIL_COLOR_COMPLETED = (0, 255, 0)   # Green
     TRAIL_COLOR_IN_ZONE = (255, 0, 0)     # Blue
     TRAIL_COLOR_DEFAULT = (0, 255, 255)   # Yellow
+    PLATE_LINE_COLOR = (255, 0, 255)      # Magenta/Purple for plate capture line
     
     def __init__(self):
         """Initialize the visualizer with annotation tools."""
         self.box_annotator = sv.BoxAnnotator()
         self.label_annotator = sv.LabelAnnotator()
         self.zones_config: List[Dict[str, Any]] = []  # Store zones for multi-zone rendering
+        self.plate_line: Optional[List[float]] = None  # Plate capture line
 
     def annotate(
         self, 
@@ -71,6 +73,9 @@ class TrafficVisualizer:
         
         # Draw all configured zones with type-based colors
         self._draw_all_zones(annotated, w, h)
+        
+        # Draw plate capture line
+        self._draw_plate_line(annotated, w, h)
         
         # Draw turn detector zone (if active and not already in zones_config)
         if turn_detector:
@@ -175,6 +180,31 @@ class TrafficVisualizer:
     def set_zones(self, zones: List[Dict[str, Any]]) -> None:
         """Set zones configuration for multi-zone rendering."""
         self.zones_config = zones
+
+    def set_plate_line(self, line: Optional[List[float]]) -> None:
+        """Set plate capture line configuration."""
+        self.plate_line = line
+
+    def _draw_plate_line(self, frame: np.ndarray, width: int, height: int) -> None:
+        """Draw the plate capture line."""
+        if not self.plate_line or len(self.plate_line) != 4:
+            return
+        
+        x1 = int(self.plate_line[0] * width)
+        y1 = int(self.plate_line[1] * height)
+        x2 = int(self.plate_line[2] * width)
+        y2 = int(self.plate_line[3] * height)
+        
+        # Draw thick magenta line
+        cv2.line(frame, (x1, y1), (x2, y2), self.PLATE_LINE_COLOR, 3)
+        
+        # Draw label at midpoint
+        mid_x = (x1 + x2) // 2
+        mid_y = (y1 + y2) // 2
+        cv2.putText(
+            frame, "PLATE CAPTURE", (mid_x - 50, mid_y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.5, self.PLATE_LINE_COLOR, 2
+        )
     
     def _draw_all_zones(self, frame: np.ndarray, width: int, height: int) -> None:
         """Draw all configured zones with type-based colors."""

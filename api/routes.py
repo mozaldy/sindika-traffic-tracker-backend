@@ -128,6 +128,27 @@ def create_config_router(config_manager: ConfigManager) -> APIRouter:
         config_manager.reload()
         return config_manager.config.to_dict()
     
+    @router.get("/plate_line")
+    async def get_plate_line():
+        """Get the plate capture line configuration."""
+        return {"plate_line": config_manager.get_plate_line()}
+    
+    @router.post("/plate_line")
+    async def set_plate_line(request: Request):
+        """
+        Set the plate capture line.
+        
+        Expected payload:
+        {
+            "plate_line": [x1, y1, x2, y2]  // normalized 0-1
+        }
+        """
+        data = await request.json()
+        line = data.get("plate_line")
+        config_manager.set_plate_line(line)
+        logger.info(f"Updated plate line: {line}")
+        return {"status": "updated", "plate_line": line}
+    
     return router
 
 

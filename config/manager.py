@@ -85,11 +85,14 @@ class AppConfig:
     modules: Dict[str, bool] = field(default_factory=lambda: DEFAULT_MODULES.copy())
     
     # Plate capture settings
-    plate_trigger: str = "on_exit"  # "on_exit", "on_speed_exceed", "always"
+    plate_trigger: str = "on_line"  # "on_line", "on_speed_exceed", "always"
     speed_threshold: float = 80.0  # km/h threshold for "on_speed_exceed" trigger
     
     # Detection zones (direction, plate)
     zones: List[ZoneConfig] = field(default_factory=list)
+    
+    # Plate capture line [x1, y1, x2, y2] normalized 0-1
+    plate_line: Optional[List[float]] = None
     
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -97,7 +100,8 @@ class AppConfig:
             "zones": [zone.to_dict() for zone in self.zones],
             "modules": self.modules,
             "plate_trigger": self.plate_trigger,
-            "speed_threshold": self.speed_threshold
+            "speed_threshold": self.speed_threshold,
+            "plate_line": self.plate_line
         }
     
     @classmethod
@@ -111,8 +115,9 @@ class AppConfig:
             lanes=lanes,
             zones=zones,
             modules=modules,
-            plate_trigger=data.get("plate_trigger", "on_exit"),
-            speed_threshold=data.get("speed_threshold", 80.0)
+            plate_trigger=data.get("plate_trigger", "on_line"),
+            speed_threshold=data.get("speed_threshold", 80.0),
+            plate_line=data.get("plate_line")
         )
 
 
@@ -180,7 +185,7 @@ class ConfigManager:
     
     def set_plate_trigger(self, trigger: str) -> None:
         """Set the plate capture trigger mode."""
-        if trigger in ("on_exit", "on_speed_exceed", "always"):
+        if trigger in ("on_exit", "on_speed_exceed", "always", "on_line"):
             self.config.plate_trigger = trigger
             self.save()
     
@@ -201,6 +206,16 @@ class ConfigManager:
         """Set zone configurations from list of dicts."""
         self.config.zones = [ZoneConfig.from_dict(zone) for zone in zones_data]
         self.save()
+
+    def get_plate_line(self) -> Optional[List[float]]:
+        """Get the plate capture line coordinates."""
+        return self.config.plate_line
+
+    def set_plate_line(self, line: Optional[List[float]]) -> None:
+        """Set the plate capture line coordinates."""
+        self.config.plate_line = line
+        self.save()
+        logger.info(f"Updated plate line: {line}")
 
     def reload(self) -> None:
         """Force reload configuration from disk."""

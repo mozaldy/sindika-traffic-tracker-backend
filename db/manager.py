@@ -7,7 +7,7 @@ import time
 import logging
 import numpy as np
 from datetime import datetime
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 from contextlib import contextmanager
 
@@ -134,6 +134,39 @@ class DatabaseManager:
                 except sqlite3.OperationalError:
                     pass
 
+    def save_captures(
+        self,
+        frame: np.ndarray,
+        bbox: List[float],
+        class_name: str,
+        speed: float,
+        plate_crop: Optional[np.ndarray] = None
+    ) -> Tuple[str, str]:
+        """
+        Save vehicle and plate images immediately.
+        
+        Args:
+            frame: Full video frame
+            bbox: Bounding box [x1, y1, x2, y2]
+            class_name: Detected object class
+            speed: Calculated speed
+            plate_crop: Cropped license plate image
+            
+        Returns:
+            Tuple of (vehicle_image_path, plate_image_path)
+        """
+        try:
+            timestamp = time.time()
+            dt_str = datetime.fromtimestamp(timestamp).strftime("%Y%m%d_%H%M%S_%f")
+            
+            image_path = self._save_vehicle_crop(frame, bbox, dt_str, class_name, speed)
+            plate_image_path = self._save_plate_crop(plate_crop, dt_str)
+            
+            return image_path, plate_image_path
+        except Exception as e:
+            logger.error(f"Failed to save captures: {e}")
+            return "", ""
+
     def log_event(
         self,
         frame: np.ndarray,
@@ -146,7 +179,9 @@ class DatabaseManager:
         crossing_start: float = 0.0,
         crossing_end: float = 0.0,
         license_plate: Optional[str] = None,
-        plate_crop: Optional[np.ndarray] = None
+        plate_crop: Optional[np.ndarray] = None,
+        image_path: Optional[str] = None,
+        plate_image_path: Optional[str] = None
     ) -> Optional[int]:
         """
         Log a traffic event with vehicle image capture.
@@ -162,7 +197,9 @@ class DatabaseManager:
             crossing_start: Timestamp when crossing started
             crossing_end: Timestamp when crossing ended
             license_plate: Detected license plate text
-            plate_crop: Cropped license plate image
+            plate_crop: Cropped license plate image (used if plate_image_path not provided)
+            image_path: Pre-saved vehicle image path (optional)
+            plate_image_path: Pre-saved plate image path (optional)
             
         Returns:
             Event ID if successful, None otherwise
@@ -171,11 +208,9 @@ class DatabaseManager:
             timestamp = time.time()
             dt_str = datetime.fromtimestamp(timestamp).strftime("%Y%m%d_%H%M%S_%f")
             
-            # Save vehicle crop
-            image_path = self._save_vehicle_crop(frame, bbox, dt_str, class_name, speed)
-            
-            # Save plate crop if available
-            plate_image_path = self._save_plate_crop(plate_crop, dt_str)
+            # Use pre-saved paths or save now
+            final_image_path = image_path if image_path else self._save_vehicle_crop(frame, bbox, dt_str, class_name, speed)
+            final_plate_path = plate_image_path if plate_image_path else self._save_plate_crop(plate_crop, dt_str)
             
             # Insert record
             with self._get_connection() as conn:
@@ -188,8 +223,8 @@ class DatabaseManager:
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     timestamp, class_name, float(speed), float(direction),
-                    direction_symbol, image_path, video_source,
-                    crossing_start, crossing_end, license_plate, plate_image_path
+                    direction_symbol, final_image_path, video_source,
+                    crossing_start, crossing_end, license_plate, final_plate_path
                 ))
                 event_id = cursor.lastrowid
             
@@ -224,7 +259,7 @@ class DatabaseManager:
         file_path = os.path.join(self.captures_dir, filename)
         cv2.imwrite(file_path, crop)
         
-        return file_path
+        return filename
 
     def _save_plate_crop(
         self,
@@ -239,7 +274,7 @@ class DatabaseManager:
         file_path = os.path.join(self.captures_dir, filename)
         cv2.imwrite(file_path, plate_crop)
         
-        return file_path
+        return filename
 
     def get_events(self, limit: int = 100, offset: int = 0) -> List[Dict[str, Any]]:
         """
@@ -308,12 +343,14 @@ class DatabaseManager:
                     return False
                 
                 # Delete images
-                for path in [row['image_path'], row['plate_image_path']]:
-                    if path and os.path.exists(path):
-                        try:
-                            os.remove(path)
-                        except OSError as err:
-                            logger.warning(f"Failed to remove {path}: {err}")
+                for filename in [row['image_path'], row['plate_image_path']]:
+                    if filename:
+                        full_path = os.path.join(self.captures_dir, filename)
+                        if os.path.exists(full_path):
+                            try:
+                                os.remove(full_path)
+                            except OSError as err:
+                                logger.warning(f"Failed to remove {full_path}: {err}")
                 
                 # Delete record
                 cursor.execute('DELETE FROM traffic_events WHERE id = ?', (event_id,))

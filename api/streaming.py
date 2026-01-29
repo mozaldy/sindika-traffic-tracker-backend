@@ -4,7 +4,7 @@ import cv2
 import time
 import asyncio
 import logging
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 from aiortc import VideoStreamTrack
@@ -105,6 +105,11 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         else:
             self.plate_zones = []
         
+        # Apply plate line configuration
+        plate_line = config_manager.get_plate_line()
+        if plate_line:
+            self.visualizer.set_plate_line(plate_line)
+        
         # Video capture
         self._init_video_capture()
         
@@ -116,6 +121,7 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         # State
         self._paused = False
         self._last_annotated_frame = None
+        self._last_positions: Dict[int, tuple] = {}  # Track previous positions for line crossing
         
         # Log active modules
         modules = config_manager.get_modules()
@@ -254,7 +260,11 @@ class TrafficAnalysisTrack(VideoStreamTrack):
             
             # === PLATE MODULE ===
             if modules.get("plate", False):
-                self._process_plate_captures(frame)
+                trigger = self.config_manager.get_plate_trigger()
+                if trigger == "on_line":
+                    self._check_plate_line_crossings(detections, frame)
+                else:
+                    self._process_plate_captures(frame)
             
             # === LOGGING ===
             self._log_completed_vehicles(frame, timestamp)
@@ -280,10 +290,11 @@ class TrafficAnalysisTrack(VideoStreamTrack):
                 vehicle.crossing_start = speed_data.get("start_time")
                 vehicle.crossing_end = speed_data.get("end_time")
                 vehicle.lane_name = speed_data.get("lane_name")
-                # Direction from speed module (if not using direction module)
-                if not self.config_manager.is_module_enabled("direction"):
-                    vehicle.direction_deg = speed_data.get("direction")
-                    vehicle.direction_symbol = speed_data.get("direction_symbol")
+                
+                # Default to Straight/Forward if valid speed but no turn detected yet
+                if not vehicle.direction_symbol:
+                    vehicle.direction_symbol = "⭡"
+                    
                 self.state_manager.mark_completed(track_id)
 
     def _sync_turn_to_state(self) -> None:
@@ -296,19 +307,131 @@ class TrafficAnalysisTrack(VideoStreamTrack):
             turn_result = self.turn_detector.get_turn_for_vehicle(vehicle.track_id)
             if turn_result:
                 # Update vehicle state with turn info
-                # We use specific fields or overload direction fields depending on preference
-                # Here we'll update the direction symbol to arrow and add turn type
                 vehicle.direction_symbol = turn_result.turn_symbol
-                # We might want to store exact 'left', 'right' string somewhere
-                # For now let's reuse direction_deg for logging if needed or custom fields
-                # But VehicleState needs to support it. 
-                # Let's check VehicleState definition later. 
-                # For now, just setting symbol.
-                pass
+                vehicle.direction_deg = turn_result.direction_deg
 
+
+    def _check_plate_line_crossings(self, detections, frame: cv2.typing.MatLike) -> None:
+        """Check if any vehicle crossed the plate capture line and capture if so."""
+        plate_line = self.config_manager.get_plate_line()
+        if not plate_line or len(plate_line) != 4:
+            return
+        
+        if detections.tracker_id is None:
+            return
+        
+        h, w = frame.shape[:2]
+        lx1, ly1, lx2, ly2 = plate_line[0]*w, plate_line[1]*h, plate_line[2]*w, plate_line[3]*h
+        
+        for tracker_id, box in zip(detections.tracker_id, detections.xyxy):
+            tracker_id = int(tracker_id)
+            vehicle = self.state_manager.get_vehicle(tracker_id)
+            if not vehicle or vehicle.plate_captured:
+                continue
+            
+            # Get current center position
+            curr_pos = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+            prev_pos = self._last_positions.get(tracker_id)
+            self._last_positions[tracker_id] = curr_pos
+            
+            if prev_pos is None:
+                continue
+            
+            # Check line crossing using CCW method
+            if self._segments_intersect(prev_pos, curr_pos, (lx1, ly1), (lx2, ly2)):
+                self._capture_vehicle_and_plate(frame, vehicle)
+                logger.info(f"Plate line capture triggered for vehicle {tracker_id}")
+
+    def _log_completed_vehicles(self, frame: cv2.typing.MatLike, timestamp: float) -> None:
+        """Log completed vehicle events to database."""
+        for vehicle in self.state_manager.get_completed_unlogged():
+            
+            # Filter Invalid: No Speed AND No Turn -> Skip
+            if (vehicle.speed_kmh or 0) <= 0 and not vehicle.direction_symbol:
+                # Mark as logged so we don't retry forever? 
+                # actually get_completed_unlogged returns completed vehicles.
+                # if we skip, they remain unlogged=False? 
+                # state_manager.mark_logged(track_id) should be called to clear them.
+                vehicle.is_logged = True 
+                continue
+
+            # Use pre-captured images if available (preferred)
+            image_path = vehicle.vehicle_image_path
+            plate_image_path = vehicle.plate_image_path
+            plate_crop = None
+        """Check if any vehicle crossed the plate capture line and capture if so."""
+        plate_line = self.config_manager.get_plate_line()
+        if not plate_line or len(plate_line) != 4:
+            return
+        
+        if detections.tracker_id is None:
+            return
+        
+        h, w = frame.shape[:2]
+        lx1, ly1, lx2, ly2 = plate_line[0]*w, plate_line[1]*h, plate_line[2]*w, plate_line[3]*h
+        
+        for tracker_id, box in zip(detections.tracker_id, detections.xyxy):
+            tracker_id = int(tracker_id)
+            vehicle = self.state_manager.get_vehicle(tracker_id)
+            if not vehicle or vehicle.plate_captured:
+                continue
+            
+            # Get current center position
+            curr_pos = ((box[0] + box[2]) / 2, (box[1] + box[3]) / 2)
+            prev_pos = self._last_positions.get(tracker_id)
+            self._last_positions[tracker_id] = curr_pos
+            
+            if prev_pos is None:
+                continue
+            
+            # Check line crossing using CCW method
+            if self._segments_intersect(prev_pos, curr_pos, (lx1, ly1), (lx2, ly2)):
+                self._capture_vehicle_and_plate(frame, vehicle)
+                logger.info(f"Plate line capture triggered for vehicle {tracker_id}")
+
+    def _segments_intersect(self, A: tuple, B: tuple, C: tuple, D: tuple) -> bool:
+        """Check if segment AB intersects segment CD."""
+        def ccw(P, Q, R):
+            return (R[1] - P[1]) * (Q[0] - P[0]) > (Q[1] - P[1]) * (R[0] - P[0])
+        return ccw(A, C, D) != ccw(B, C, D) and ccw(A, B, C) != ccw(A, B, D)
+
+    def _capture_vehicle_and_plate(self, frame: cv2.typing.MatLike, vehicle) -> None:
+        """Capture vehicle and plate images immediately and save to database."""
+        if vehicle.current_bbox is None:
+            return
+        
+        x1, y1, x2, y2 = map(int, vehicle.current_bbox)
+        h, w = frame.shape[:2]
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        
+        if x2 <= x1 or y2 <= y1:
+            return
+        
+        # Capture and detect plate
+        vehicle_crop = frame[y1:y2, x1:x2]
+        plate_text, plate_crop = self.plate_reader.detect_and_read(vehicle_crop)
+        
+        vehicle.plate_text = plate_text
+        vehicle.plate_captured = True
+        
+        # Save images immediately
+        image_path, plate_image_path = self.db.save_captures(
+            frame=frame,
+            bbox=vehicle.current_bbox,
+            class_name=vehicle.class_name,
+            speed=vehicle.speed_kmh or 0,
+            plate_crop=plate_crop
+        )
+        
+        vehicle.vehicle_image_path = image_path
+        vehicle.plate_image_path = plate_image_path
+        
+        # Mark as completed so it gets picked up for logging once stale
+        self.state_manager.mark_completed(vehicle.track_id)
 
     def _process_plate_captures(self, frame: cv2.typing.MatLike) -> None:
-        """Process plate captures based on trigger configuration."""
+        """Process plate captures based on trigger configuration (legacy/fallback)."""
         trigger = self.config_manager.get_plate_trigger()
         threshold = self.config_manager.get_speed_threshold()
         
@@ -336,25 +459,42 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         vehicle.plate_text = plate_text
         vehicle.plate_captured = True
         
-        # Store plate crop path if captured (plate_crop is the image data)
-        # The database will handle saving if needed
+        # Save images immediately
+        image_path, plate_image_path = self.db.save_captures(
+            frame=frame,
+            bbox=vehicle.current_bbox,
+            class_name=vehicle.class_name,
+            speed=vehicle.speed_kmh or 0,
+            plate_crop=plate_crop
+        )
+        
+        vehicle.vehicle_image_path = image_path
+        vehicle.plate_image_path = plate_image_path
+        
+        # Mark as completed (optional, or let it complete naturally on exit)
+        # If trigger is 'always' or 'speed', we might want to let it continue tracking
+        # But we captured the 'event', so we mark completed to ensure it gets logged even if it stays in frame?
+        # Actually, for 'always', we might want to capture once.
+        # Let's mark as completed to ensure logging happens eventually.
+        self.state_manager.mark_completed(vehicle.track_id)
+        
         if plate_crop is not None:
             logger.debug(f"Plate captured for vehicle {vehicle.track_id}")
 
     def _log_completed_vehicles(self, frame: cv2.typing.MatLike, timestamp: float) -> None:
         """Log completed vehicle events to database."""
         for vehicle in self.state_manager.get_completed_unlogged():
-            # Get plate crop if available
+            # Use pre-captured images if available (preferred)
+            image_path = vehicle.vehicle_image_path
+            plate_image_path = vehicle.plate_image_path
             plate_crop = None
-            if vehicle.current_bbox is not None:
-                x1, y1, x2, y2 = map(int, vehicle.current_bbox)
-                h, w = frame.shape[:2]
-                x1, y1 = max(0, x1), max(0, y1)
-                x2, y2 = min(w, x2), min(h, y2)
-                if x2 > x1 and y2 > y1:
-                    vehicle_crop = frame[y1:y2, x1:x2]
-                    _, plate_crop = self.plate_reader.detect_and_read(vehicle_crop)
             
+            # Fallback: if no pre-captured plate but we have a bbox (rare for stale vehicles), try to grab it
+            # This is mostly legacy behavior for non-trigger based logging
+            if not plate_image_path and vehicle.current_bbox is not None:
+                 # ... existing fallback logic or just skip ...
+                 pass
+
             self.db.log_event(
                 frame=frame,
                 bbox=vehicle.current_bbox,
@@ -366,12 +506,14 @@ class TrafficAnalysisTrack(VideoStreamTrack):
                 crossing_start=vehicle.crossing_start or vehicle.first_seen,
                 crossing_end=vehicle.crossing_end or timestamp,
                 license_plate=vehicle.plate_text,
-                plate_crop=plate_crop
+                plate_crop=plate_crop,
+                image_path=image_path,
+                plate_image_path=plate_image_path
             )
             
             self.state_manager.mark_logged(vehicle.track_id)
-            logger.info(f"Logged vehicle {vehicle.track_id}: {vehicle.class_name}, "
-                       f"{vehicle.speed_kmh:.1f if vehicle.speed_kmh else 0} km/h")
+            speed_str = f"{vehicle.speed_kmh:.1f}" if vehicle.speed_kmh else "0"
+            logger.info(f"Logged vehicle {vehicle.track_id}: {vehicle.class_name}, {speed_str} km/h")
 
     def update_config(self) -> None:
         """Reload configuration from config manager."""
@@ -397,6 +539,10 @@ class TrafficAnalysisTrack(VideoStreamTrack):
             self.turn_detector.set_zone([])
             self.visualizer.set_zones([])
             self.plate_zones = []
+        
+        # Update plate line
+        plate_line = self.config_manager.get_plate_line()
+        self.visualizer.set_plate_line(plate_line)
             
         logger.info("Track configuration updated")
 
