@@ -9,6 +9,14 @@ from dataclasses import dataclass, field
 logger = logging.getLogger(__name__)
 
 
+# Default module configuration
+DEFAULT_MODULES = {
+    "speed": True,
+    "turn": False,  # Turn detection (requires zone config)
+    "plate": False  # Off by default (expensive)
+}
+
+
 @dataclass
 class LaneConfig:
     """Configuration for a single detection lane."""
@@ -36,19 +44,61 @@ class LaneConfig:
 
 
 @dataclass
+class ZoneConfig:
+    """Configuration for a turn detection zone."""
+    name: str
+    points: List[List[float]]  # [[x1,y1], [x2,y2], ...] normalized 0-1
+    
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "points": self.points
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "ZoneConfig":
+        return cls(
+            name=data.get("name", "Zone"),
+            points=data.get("points", [])
+        )
+
+
+@dataclass
 class AppConfig:
     """Application configuration."""
     lanes: List[LaneConfig] = field(default_factory=list)
     
+    # Module toggles
+    modules: Dict[str, bool] = field(default_factory=lambda: DEFAULT_MODULES.copy())
+    
+    # Plate capture settings
+    plate_trigger: str = "on_exit"  # "on_exit", "on_speed_exceed", "always"
+    speed_threshold: float = 80.0  # km/h threshold for "on_speed_exceed" trigger
+    
+    # Turn detection zones
+    turn_zones: List[ZoneConfig] = field(default_factory=list)
+    
     def to_dict(self) -> Dict[str, Any]:
         return {
-            "lanes": [lane.to_dict() for lane in self.lanes]
+            "lanes": [lane.to_dict() for lane in self.lanes],
+            "turn_zones": [zone.to_dict() for zone in self.turn_zones],
+            "modules": self.modules,
+            "plate_trigger": self.plate_trigger,
+            "speed_threshold": self.speed_threshold
         }
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "AppConfig":
         lanes = [LaneConfig.from_dict(lane) for lane in data.get("lanes", [])]
-        return cls(lanes=lanes)
+        turn_zones = [ZoneConfig.from_dict(zone) for zone in data.get("turn_zones", [])]
+        modules = {**DEFAULT_MODULES, **data.get("modules", {})}
+        return cls(
+            lanes=lanes,
+            turn_zones=turn_zones,
+            modules=modules,
+            plate_trigger=data.get("plate_trigger", "on_exit"),
+            speed_threshold=data.get("speed_threshold", 80.0)
+        )
 
 
 class ConfigManager:
@@ -95,6 +145,49 @@ class ConfigManager:
         self.config.lanes = [LaneConfig.from_dict(lane) for lane in lanes_data]
         self.save()
     
+    def get_modules(self) -> Dict[str, bool]:
+        """Get current module configuration."""
+        return self.config.modules.copy()
+    
+    def set_modules(self, modules: Dict[str, bool]) -> None:
+        """Set module configuration."""
+        self.config.modules.update(modules)
+        self.save()
+        logger.info(f"Updated modules: {self.config.modules}")
+    
+    def is_module_enabled(self, module_name: str) -> bool:
+        """Check if a specific module is enabled."""
+        return self.config.modules.get(module_name, False)
+    
+    def get_plate_trigger(self) -> str:
+        """Get the plate capture trigger mode."""
+        return self.config.plate_trigger
+    
+    def set_plate_trigger(self, trigger: str) -> None:
+        """Set the plate capture trigger mode."""
+        if trigger in ("on_exit", "on_speed_exceed", "always"):
+            self.config.plate_trigger = trigger
+            self.save()
+    
+    def get_speed_threshold(self) -> float:
+        """Get the speed threshold for plate capture trigger."""
+        return self.config.speed_threshold
+    
+    def set_speed_threshold(self, threshold: float) -> None:
+        """Set the speed threshold for plate capture trigger."""
+        self.config.speed_threshold = threshold
+        self.save()
+    
+    def get_zones(self) -> List[Dict[str, Any]]:
+        """Get zone configurations as list of dicts."""
+        return [zone.to_dict() for zone in self.config.turn_zones]
+
+    def set_zones(self, zones_data: List[Dict[str, Any]]) -> None:
+        """Set zone configurations from list of dicts."""
+        self.config.turn_zones = [ZoneConfig.from_dict(zone) for zone in zones_data]
+        self.save()
+
     def reload(self) -> None:
         """Force reload configuration from disk."""
         self._config = self._load()
+

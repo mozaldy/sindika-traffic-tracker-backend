@@ -3,7 +3,10 @@
 import logging
 import cv2
 import numpy as np
-from typing import Tuple, Optional
+from typing import Tuple, Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from engine.state import VehicleState
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +42,48 @@ class LicensePlateReader:
             except Exception as e:
                 logger.error(f"Failed to load LicensePlateDetector: {e}")
                 self._detector = False  # Mark as failed
+
+    def should_capture(
+        self,
+        vehicle: "VehicleState",
+        trigger: str,
+        speed_threshold: float = 80.0
+    ) -> bool:
+        """
+        Determine if plate should be captured based on trigger mode.
+        
+        Trigger modes:
+        - "always": Capture plate for every vehicle (once)
+        - "on_exit": Capture plate when vehicle exits detection zone
+        - "on_speed_exceed": Capture plate only if speed exceeds threshold
+        
+        Args:
+            vehicle: The vehicle state to check
+            trigger: Trigger mode string
+            speed_threshold: Speed threshold for "on_speed_exceed" trigger
+            
+        Returns:
+            True if plate should be captured, False otherwise
+        """
+        # Already captured, don't capture again
+        if vehicle.plate_captured:
+            return False
+        
+        if trigger == "always":
+            # Capture for any vehicle with sufficient trajectory
+            return len(vehicle.trajectory) > 5
+        
+        elif trigger == "on_exit":
+            # Capture when vehicle has completed crossing (has crossing_end)
+            return vehicle.crossing_end is not None
+        
+        elif trigger == "on_speed_exceed":
+            # Capture only if speed exceeds threshold
+            if vehicle.speed_kmh is not None:
+                return vehicle.speed_kmh > speed_threshold
+            return False
+        
+        return False
 
     def detect_and_read(
         self, 
@@ -89,3 +134,4 @@ class LicensePlateReader:
         except Exception as e:
             logger.error(f"License plate detection failed: {e}")
             return None, None
+

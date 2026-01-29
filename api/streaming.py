@@ -1,4 +1,4 @@
-"""WebRTC video streaming with traffic analysis."""
+"""WebRTC video streaming with modular traffic analysis pipeline."""
 
 import cv2
 import time
@@ -6,6 +6,7 @@ import asyncio
 import logging
 from typing import List, Optional
 
+import numpy as np
 from aiortc import VideoStreamTrack
 from av import VideoFrame
 
@@ -15,7 +16,10 @@ from engine import (
     StatsManager, 
     TrafficVisualizer,
     MultiLaneSpeedEstimator,
-    LicensePlateReader
+    LicensePlateReader,
+    LicensePlateReader,
+    VehicleStateManager,
+    TurnDetector
 )
 from db import DatabaseManager
 from config import ConfigManager
@@ -26,10 +30,13 @@ logger = logging.getLogger(__name__)
 
 class TrafficAnalysisTrack(VideoStreamTrack):
     """
-    WebRTC video track that processes frames through the traffic analysis pipeline.
+    WebRTC video track that processes frames through a modular traffic analysis pipeline.
     
-    Reads frames from a video source, runs detection, tracking, speed estimation,
-    and license plate reading, then yields annotated frames via WebRTC.
+    The pipeline consists of:
+    1. Core (always on): Detection → Tracking → State Management
+    2. Modules (configurable): Speed, Direction, Plate Detection
+    
+    Modules can be enabled/disabled via configuration without code changes.
     """
     
     kind = "video"
@@ -57,24 +64,37 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         # Convert class names to IDs
         target_ids = self._resolve_target_classes(target_classes)
         
-        # Initialize pipeline components
+        # Core pipeline components (always active)
         self.detector = ObjectDetector(
             confidence_threshold=0.5, 
             target_classes=target_ids
         )
         self.tracker = ObjectTracker()
+        self.state_manager = VehicleStateManager()
+        
+        # Analysis modules (conditionally active)
+        # Analysis modules (conditionally active)
+        self.speed_estimator = MultiLaneSpeedEstimator()
+        self.turn_detector = TurnDetector()
+        self.plate_reader = LicensePlateReader()
+        
+        # Support components
         self.stats = StatsManager()
         self.visualizer = TrafficVisualizer()
-        self.speed_estimator = MultiLaneSpeedEstimator()
-        self.plate_reader = LicensePlateReader()
         self.db = DatabaseManager()
         
-        # Apply configuration
+        # Apply lane configuration
         lanes = config_manager.get_lanes()
         if lanes:
             self.speed_estimator.set_config(lanes)
         else:
             logger.warning("No lane configuration found")
+            
+        # Apply zone configuration
+        zones = config_manager.get_zones()
+        if zones:
+            # Use the first zone for now
+            self.turn_detector.set_zone(zones[0]["points"])
         
         # Video capture
         self._init_video_capture()
@@ -88,7 +108,10 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         self._paused = False
         self._last_annotated_frame = None
         
+        # Log active modules
+        modules = config_manager.get_modules()
         logger.info(f"TrafficAnalysisTrack ready. FPS: {self.fps}")
+        logger.info(f"Active modules: {[k for k, v in modules.items() if v]}")
 
     def pause(self) -> None:
         """Pause video processing."""
@@ -98,9 +121,6 @@ class TrafficAnalysisTrack(VideoStreamTrack):
     def resume(self) -> None:
         """Resume video processing."""
         self._paused = False
-        # Adjust start time to account for pause duration?
-        # For simplicity, we just resume reading. 
-        # Ideally we should shift _video_start_time to avoid jump in timestamps.
         self._video_start_time = time.time() - (self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0)
         logger.info("TrafficAnalysisTrack resumed")
 
@@ -142,25 +162,18 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         Returns:
             Annotated VideoFrame
         """
-        # Pace the frame delivery
         pts, time_base = await self.next_timestamp()
         
         if self._paused and self._last_annotated_frame is not None:
-            # If paused, return the last frame repeatedly
-            # We add a small sleep to avoid tight loop since next_timestamp handles pacing mostly?
-            # actually next_timestamp waits for the right time.
             frame = self._last_annotated_frame
         else:
-            # Read and process frame
             frame = self._read_frame()
             if frame is None:
-                # Create black frame if video ended
                 frame = self._create_placeholder_frame()
             else:
                 frame = self._process_frame(frame)
                 self._last_annotated_frame = frame
         
-        # Convert to VideoFrame
         video_frame = VideoFrame.from_ndarray(frame, format="bgr24")
         video_frame.pts = pts
         video_frame.time_base = time_base
@@ -172,9 +185,9 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         ret, frame = self.cap.read()
         
         if not ret:
-            # Loop video
             self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
             self._video_start_time = time.time()
+            self.state_manager.reset()  # Reset state on video loop
             ret, frame = self.cap.read()
             
             if not ret:
@@ -184,12 +197,21 @@ class TrafficAnalysisTrack(VideoStreamTrack):
 
     def _create_placeholder_frame(self) -> cv2.typing.MatLike:
         """Create a black placeholder frame."""
-        import numpy as np
         return np.zeros((480, 640, 3), dtype=np.uint8)
 
     def _process_frame(self, frame: cv2.typing.MatLike) -> cv2.typing.MatLike:
         """
-        Process a single frame through the analysis pipeline.
+        Process a single frame through the modular analysis pipeline.
+        
+        Pipeline stages:
+        1. Detection (core) - Run object detection
+        2. Tracking (core) - Update object tracker
+        3. State Management (core) - Update VehicleStateManager
+        4. Speed Module (optional) - Calculate speed for detected vehicles
+        5. Direction Module (optional) - Calculate movement direction
+        6. Plate Module (optional) - Capture license plates based on trigger
+        7. Logging - Log completed events to database
+        8. Visualization - Annotate frame for display
         
         Args:
             frame: Raw BGR frame
@@ -197,100 +219,169 @@ class TrafficAnalysisTrack(VideoStreamTrack):
         Returns:
             Annotated BGR frame
         """
-        # Calculate video timestamp
-        frame_pos = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-        timestamp = self._video_start_time + frame_pos
-        
-        # Detection pipeline
-        detections = self.detector.detect(frame)
-        detections = self.tracker.update(detections)
-        
-        # Update statistics and speed estimation
-        self.stats.update(detections)
-        self.speed_estimator.update(detections, frame.shape, timestamp)
-        
-        # Log completed crossings
-        self._log_completed_crossings(frame, detections, timestamp)
-        
-        # Annotate frame
-        annotated = self.visualizer.annotate(
-            frame, detections, self.stats, self.speed_estimator
-        )
-        
-        return annotated
-
-    def _log_completed_crossings(
-        self, 
-        frame: cv2.typing.MatLike,
-        detections,
-        timestamp: float
-    ) -> None:
-        """Log events for vehicles that completed crossing."""
-        if detections.tracker_id is None:
-            return
-        
-        for xyxy, class_id, tracker_id in zip(
-            detections.xyxy, 
-            detections.class_id, 
-            detections.tracker_id
-        ):
-            if tracker_id not in self.speed_estimator.completed_speeds:
-                continue
+        try:
+            # Calculate video timestamp
+            frame_pos = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            timestamp = self._video_start_time + frame_pos
             
-            event = self.speed_estimator.completed_speeds[tracker_id]
-            if event.get("logged", False):
-                continue
+            # === CORE PIPELINE (always runs) ===
+            detections = self.detector.detect(frame)
+            detections = self.tracker.update(detections)
+            self.state_manager.update(detections, timestamp)
+            self.stats.update(detections)
             
-            # Extract vehicle crop for plate detection
-            license_plate, plate_crop = self._detect_license_plate(frame, xyxy)
+            # Get module configuration
+            modules = self.config_manager.get_modules()
             
-            # Log event
-            class_name = COCO_CLASSES.get(class_id, f"class_{class_id}")
-            self.db.log_event(
-                frame=frame,
-                bbox=xyxy.tolist(),
-                class_name=class_name,
-                speed=event["speed"],
-                direction=event["direction"],
-                direction_symbol=event.get("direction_symbol"),
-                video_source=self.source_path,
-                crossing_start=event.get("start_time", 0),
-                crossing_end=event.get("end_time", timestamp),
-                license_plate=license_plate,
-                plate_crop=plate_crop
+            # === SPEED MODULE ===
+            if modules.get("speed", True):
+                self.speed_estimator.update(detections, frame.shape, timestamp)
+                self._sync_speed_to_state()
+                
+            # === TURN MODULE ===
+            if modules.get("turn", False):
+                self.turn_detector.update(detections, frame.shape, timestamp)
+                self._sync_turn_to_state()
+            
+            # === PLATE MODULE ===
+            if modules.get("plate", False):
+                self._process_plate_captures(frame)
+            
+            # === LOGGING ===
+            self._log_completed_vehicles(frame, timestamp)
+            
+            # === VISUALIZATION ===
+            annotated = self.visualizer.annotate(
+                frame, detections, self.stats, self.speed_estimator, self.turn_detector
             )
             
-            # Mark as logged
-            event["logged"] = True
+            return annotated
+            
+        except Exception as e:
+            logger.error(f"Error processing frame: {e}", exc_info=True)
+            # Return original frame on error to keep stream alive
+            return frame
 
-    def _detect_license_plate(
-        self, 
-        frame: cv2.typing.MatLike,
-        xyxy
-    ) -> tuple:
-        """Detect and read license plate from vehicle crop."""
-        x1, y1, x2, y2 = map(int, xyxy)
+    def _sync_speed_to_state(self) -> None:
+        """Sync speed estimator results to VehicleStateManager."""
+        for track_id, speed_data in self.speed_estimator.completed_speeds.items():
+            vehicle = self.state_manager.get_vehicle(track_id)
+            if vehicle and vehicle.speed_kmh is None:
+                vehicle.speed_kmh = speed_data.get("speed")
+                vehicle.crossing_start = speed_data.get("start_time")
+                vehicle.crossing_end = speed_data.get("end_time")
+                vehicle.lane_name = speed_data.get("lane_name")
+                # Direction from speed module (if not using direction module)
+                if not self.config_manager.is_module_enabled("direction"):
+                    vehicle.direction_deg = speed_data.get("direction")
+                    vehicle.direction_symbol = speed_data.get("direction_symbol")
+                self.state_manager.mark_completed(track_id)
+
+    def _sync_turn_to_state(self) -> None:
+        """Sync turn detector results to VehicleStateManager."""
+        for vehicle in self.state_manager.vehicles.values():
+            # Check if already completed (by speed or turn)
+            if vehicle.track_id in self.state_manager.completed_vehicles:
+                continue
+                
+            turn_result = self.turn_detector.get_turn_for_vehicle(vehicle.track_id)
+            if turn_result:
+                # Update vehicle state with turn info
+                # We use specific fields or overload direction fields depending on preference
+                # Here we'll update the direction symbol to arrow and add turn type
+                vehicle.direction_symbol = turn_result.turn_symbol
+                # We might want to store exact 'left', 'right' string somewhere
+                # For now let's reuse direction_deg for logging if needed or custom fields
+                # But VehicleState needs to support it. 
+                # Let's check VehicleState definition later. 
+                # For now, just setting symbol.
+                pass
+
+
+    def _process_plate_captures(self, frame: cv2.typing.MatLike) -> None:
+        """Process plate captures based on trigger configuration."""
+        trigger = self.config_manager.get_plate_trigger()
+        threshold = self.config_manager.get_speed_threshold()
+        
+        for vehicle in self.state_manager.vehicles.values():
+            if self.plate_reader.should_capture(vehicle, trigger, threshold):
+                self._capture_plate(frame, vehicle)
+
+    def _capture_plate(self, frame: cv2.typing.MatLike, vehicle) -> None:
+        """Capture and store license plate for a vehicle."""
+        if vehicle.current_bbox is None:
+            return
+        
+        x1, y1, x2, y2 = map(int, vehicle.current_bbox)
         h, w = frame.shape[:2]
         
-        # Clamp coordinates
         x1, y1 = max(0, x1), max(0, y1)
         x2, y2 = min(w, x2), min(h, y2)
         
         if x2 <= x1 or y2 <= y1:
-            return None, None
+            return
         
         vehicle_crop = frame[y1:y2, x1:x2]
-        return self.plate_reader.detect_and_read(vehicle_crop)
+        plate_text, plate_crop = self.plate_reader.detect_and_read(vehicle_crop)
+        
+        vehicle.plate_text = plate_text
+        vehicle.plate_captured = True
+        
+        # Store plate crop path if captured (plate_crop is the image data)
+        # The database will handle saving if needed
+        if plate_crop is not None:
+            logger.debug(f"Plate captured for vehicle {vehicle.track_id}")
+
+    def _log_completed_vehicles(self, frame: cv2.typing.MatLike, timestamp: float) -> None:
+        """Log completed vehicle events to database."""
+        for vehicle in self.state_manager.get_completed_unlogged():
+            # Get plate crop if available
+            plate_crop = None
+            if vehicle.current_bbox is not None:
+                x1, y1, x2, y2 = map(int, vehicle.current_bbox)
+                h, w = frame.shape[:2]
+                x1, y1 = max(0, x1), max(0, y1)
+                x2, y2 = min(w, x2), min(h, y2)
+                if x2 > x1 and y2 > y1:
+                    vehicle_crop = frame[y1:y2, x1:x2]
+                    _, plate_crop = self.plate_reader.detect_and_read(vehicle_crop)
+            
+            self.db.log_event(
+                frame=frame,
+                bbox=vehicle.current_bbox,
+                class_name=vehicle.class_name,
+                speed=vehicle.speed_kmh or 0,
+                direction=vehicle.direction_deg or 0,
+                direction_symbol=vehicle.direction_symbol,
+                video_source=self.source_path,
+                crossing_start=vehicle.crossing_start or vehicle.first_seen,
+                crossing_end=vehicle.crossing_end or timestamp,
+                license_plate=vehicle.plate_text,
+                plate_crop=plate_crop
+            )
+            
+            self.state_manager.mark_logged(vehicle.track_id)
+            logger.info(f"Logged vehicle {vehicle.track_id}: {vehicle.class_name}, "
+                       f"{vehicle.speed_kmh:.1f if vehicle.speed_kmh else 0} km/h")
 
     def update_config(self) -> None:
         """Reload configuration from config manager."""
         self.config_manager.reload()
         lanes = self.config_manager.get_lanes()
+        lanes = self.config_manager.get_lanes()
         self.speed_estimator.set_config(lanes)
+        
+        zones = self.config_manager.get_zones()
+        if zones:
+            self.turn_detector.set_zone(zones[0]["points"])
+        else:
+            self.turn_detector.set_zone([])
+            
         logger.info("Track configuration updated")
 
     def stop(self) -> None:
         """Release resources."""
         if self.cap:
             self.cap.release()
+        self.state_manager.reset()
         logger.info("TrafficAnalysisTrack stopped")

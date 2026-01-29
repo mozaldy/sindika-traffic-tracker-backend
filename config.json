@@ -32,5 +32,13 @@
       ],
       "distance": 5
     }
-  ]
+  ],
+  "turn_zones": [],
+  "modules": {
+    "speed": false,
+    "turn": true,
+    "plate": false
+  },
+  "plate_trigger": "on_exit",
+  "speed_threshold": 80
 }

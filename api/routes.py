@@ -49,6 +49,77 @@ def create_config_router(config_manager: ConfigManager) -> APIRouter:
         logger.info(f"Updated {len(lanes)} lane configurations")
         return {"status": "updated", "lane_count": len(lanes)}
     
+    @router.get("/zones")
+    async def get_zones():
+        """Get current zone configurations."""
+        return {"zones": config_manager.get_zones()}
+
+    @router.post("/zones")
+    async def set_zones(request: Request):
+        """
+        Set zone configurations.
+        
+        Expected payload:
+        {
+            "zones": [
+                {
+                    "name": "Intersection A",
+                    "points": [[x1, y1], [x2, y2], [x3, y3], [x4, y4]]
+                }
+            ]
+        }
+        """
+        data = await request.json()
+        zones = data.get("zones", [])
+        config_manager.set_zones(zones)
+        
+        logger.info(f"Updated {len(zones)} zone configurations")
+        return {"status": "updated", "zone_count": len(zones)}
+    
+    @router.get("/modules")
+    async def get_modules():
+        """Get current module configuration."""
+        return {
+            "modules": config_manager.get_modules(),
+            "plate_trigger": config_manager.get_plate_trigger(),
+            "speed_threshold": config_manager.get_speed_threshold()
+        }
+    
+    @router.post("/modules")
+    async def set_modules(request: Request):
+        """
+        Set module configuration.
+        
+        Expected payload:
+        {
+            "modules": {
+                "speed": true,
+                "direction": true,
+                "plate": false
+            },
+            "plate_trigger": "on_exit",  // optional
+            "speed_threshold": 80.0      // optional
+        }
+        """
+        data = await request.json()
+        
+        if "modules" in data:
+            config_manager.set_modules(data["modules"])
+        
+        if "plate_trigger" in data:
+            config_manager.set_plate_trigger(data["plate_trigger"])
+        
+        if "speed_threshold" in data:
+            config_manager.set_speed_threshold(data["speed_threshold"])
+        
+        logger.info(f"Updated module configuration: {config_manager.get_modules()}")
+        return {
+            "status": "updated",
+            "modules": config_manager.get_modules(),
+            "plate_trigger": config_manager.get_plate_trigger(),
+            "speed_threshold": config_manager.get_speed_threshold()
+        }
+    
     @router.get("/lines")
     async def get_lines():
         """Legacy endpoint for backwards compatibility."""

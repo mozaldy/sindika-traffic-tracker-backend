@@ -9,6 +9,7 @@ from constants import COCO_CLASSES
 
 if TYPE_CHECKING:
     from .speed import MultiLaneSpeedEstimator
+    from .turn import TurnDetector
 
 
 class TrafficVisualizer:
@@ -41,6 +42,7 @@ class TrafficVisualizer:
         detections: sv.Detections, 
         stats: any,
         speed_estimator: "MultiLaneSpeedEstimator",
+        turn_detector: Optional["TurnDetector"] = None,
         timestamp_info: Optional[str] = None
     ) -> np.ndarray:
         """
@@ -60,13 +62,15 @@ class TrafficVisualizer:
         h, w = frame.shape[:2]
         
         # Draw lane lines
-        self._draw_lanes(annotated, speed_estimator.lanes, w, h)
-        
+        # Draw zone if present
+        if turn_detector:
+            self._draw_zone(annotated, turn_detector, w, h)
+            
         # Draw vehicle trails
-        self._draw_trails(annotated, speed_estimator)
+        self._draw_trails(annotated, speed_estimator, turn_detector)
         
         # Create labels and annotate detections
-        labels = self._create_labels(detections, speed_estimator)
+        labels = self._create_labels(detections, speed_estimator, turn_detector)
         annotated = self.box_annotator.annotate(scene=annotated, detections=detections)
         annotated = self.label_annotator.annotate(
             scene=annotated, 
@@ -131,6 +135,33 @@ class TrafficVisualizer:
         # Apply opacity overlay
         cv2.addWeighted(overlay, 0.1, frame, 0.9, 0, frame)
 
+    def _draw_zone(
+        self,
+        frame: np.ndarray,
+        turn_detector: "TurnDetector",
+        width: int,
+        height: int
+    ) -> None:
+        """Draw turn detection zone."""
+        polygon = turn_detector.get_zone_polygon_pixels((height, width))
+        if polygon is not None:
+            # Draw polygon
+            cv2.polylines(frame, [polygon.reshape((-1, 1, 2))], True, (0, 255, 0), 2)
+            
+            # Draw edge numbers
+            for i in range(len(polygon)):
+                p1 = polygon[i]
+                p2 = polygon[(i + 1) % len(polygon)]
+                mid = (int((p1[0] + p2[0]) / 2), int((p1[1] + p2[1]) / 2))
+                
+                # Draw white circle background
+                cv2.circle(frame, mid, 12, (255, 255, 255), -1)
+                # Draw number
+                cv2.putText(
+                    frame, str(i + 1), (mid[0] - 5, mid[1] + 5),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 2
+                )
+
     def _put_label(self, frame, text, pt1, pt2, color):
         """Helper to put label on a line."""
         mid = ((pt1[0] + pt2[0]) // 2, (pt1[1] + pt2[1]) // 2)
@@ -160,7 +191,8 @@ class TrafficVisualizer:
     def _draw_trails(
         self, 
         frame: np.ndarray, 
-        speed_estimator: "MultiLaneSpeedEstimator"
+        speed_estimator: "MultiLaneSpeedEstimator",
+        turn_detector: Optional["TurnDetector"] = None
     ) -> None:
         """Draw vehicle movement trails."""
         for tid, trail in speed_estimator.active_trails.items():
@@ -175,11 +207,19 @@ class TrafficVisualizer:
                 
                 points = np.array(trail, dtype=np.int32)
                 cv2.polylines(frame, [points], False, color, 2)
+                
+        # Also draw trails from turn detector if speed estimator didn't cover them
+        if turn_detector:
+            for tid, trail in turn_detector.active_trails.items():
+                if tid not in speed_estimator.active_trails and len(trail) > 1:
+                    points = np.array(trail, dtype=np.int32)
+                    cv2.polylines(frame, [points], False, self.TRAIL_COLOR_DEFAULT, 2)
 
     def _create_labels(
         self, 
         detections: sv.Detections, 
-        speed_estimator: "MultiLaneSpeedEstimator"
+        speed_estimator: "MultiLaneSpeedEstimator",
+        turn_detector: Optional["TurnDetector"] = None
     ) -> list:
         """Create labels for each detected object."""
         labels = []
@@ -208,6 +248,14 @@ class TrafficVisualizer:
                 if lane_idx < len(speed_estimator.lanes):
                     lane_name = speed_estimator.lanes[lane_idx].get('name', f'Lane {lane_idx+1}')
                     label += f" [Crossing {lane_name}]"
+            
+            # Add turn info
+            if turn_detector:
+                turn_res = turn_detector.get_turn_for_vehicle(tid)
+                if turn_res:
+                    label += f" {turn_res.turn_symbol} {turn_res.turn_type.upper()}"
+                elif turn_detector.is_vehicle_in_zone(tid):
+                    label += " [In Zone]"
             
             labels.append(label)
         
