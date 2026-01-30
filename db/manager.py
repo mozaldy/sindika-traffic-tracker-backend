@@ -23,6 +23,8 @@ class TrafficEvent:
     speed_kmh: float = 0.0
     direction_deg: float = 0.0
     direction_symbol: Optional[str] = None
+    entry_edge: Optional[int] = None
+    exit_edge: Optional[int] = None
     image_path: str = ""
     video_source: str = "unknown"
     crossing_start: float = 0.0
@@ -48,7 +50,9 @@ class DatabaseManager:
         'crossing_start', 
         'crossing_end',
         'license_plate',
-        'plate_image_path'
+        'plate_image_path',
+        'entry_edge',
+        'exit_edge'
     ]
     
     def __init__(self, db_path: str = "traffic_data.db", captures_dir: str = "captures"):
@@ -101,6 +105,8 @@ class DatabaseManager:
                     speed_kmh REAL,
                     direction_deg REAL,
                     direction_symbol TEXT,
+                    entry_edge INTEGER,
+                    exit_edge INTEGER,
                     image_path TEXT,
                     video_source TEXT,
                     crossing_start REAL,
@@ -124,6 +130,8 @@ class DatabaseManager:
             'crossing_end': 'ALTER TABLE traffic_events ADD COLUMN crossing_end REAL',
             'license_plate': 'ALTER TABLE traffic_events ADD COLUMN license_plate TEXT',
             'plate_image_path': 'ALTER TABLE traffic_events ADD COLUMN plate_image_path TEXT',
+            'entry_edge': 'ALTER TABLE traffic_events ADD COLUMN entry_edge INTEGER',
+            'exit_edge': 'ALTER TABLE traffic_events ADD COLUMN exit_edge INTEGER',
         }
         
         for column, sql in migrations.items():
@@ -175,6 +183,8 @@ class DatabaseManager:
         speed: float,
         direction: float,
         direction_symbol: Optional[str] = None,
+        entry_edge: Optional[int] = None,
+        exit_edge: Optional[int] = None,
         video_source: str = "unknown",
         crossing_start: float = 0.0,
         crossing_end: float = 0.0,
@@ -193,6 +203,8 @@ class DatabaseManager:
             speed: Calculated speed in km/h
             direction: Direction angle in degrees
             direction_symbol: Unicode direction symbol
+            entry_edge: Edge number the vehicle entered zone (1-indexed)
+            exit_edge: Edge number the vehicle exited zone (1-indexed)
             video_source: Source video identifier
             crossing_start: Timestamp when crossing started
             crossing_end: Timestamp when crossing ended
@@ -218,13 +230,13 @@ class DatabaseManager:
                 cursor.execute('''
                     INSERT INTO traffic_events 
                     (timestamp, class_name, speed_kmh, direction_deg, direction_symbol, 
-                     image_path, video_source, crossing_start, crossing_end, 
-                     license_plate, plate_image_path)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     entry_edge, exit_edge, image_path, video_source, crossing_start, 
+                     crossing_end, license_plate, plate_image_path)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (
                     timestamp, class_name, float(speed), float(direction),
-                    direction_symbol, final_image_path, video_source,
-                    crossing_start, crossing_end, license_plate, final_plate_path
+                    direction_symbol, entry_edge, exit_edge, final_image_path, 
+                    video_source, crossing_start, crossing_end, license_plate, final_plate_path
                 ))
                 event_id = cursor.lastrowid
             

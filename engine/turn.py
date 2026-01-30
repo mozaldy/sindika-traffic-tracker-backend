@@ -20,6 +20,8 @@ class TurnResult:
     turn_type: str  # "forward", "left", "right", "uturn"
     turn_symbol: str  # Arrow symbol
     timestamp: float
+    entry_edge: int = 0  # Edge number the vehicle entered from (0-indexed internally, display as 1-indexed)
+    exit_edge: int = 0   # Edge number the vehicle exited from
 
 
 class TurnDetector:
@@ -125,14 +127,7 @@ class TurnDetector:
             if is_inside and not was_inside:
                 self.objects_in_zone.add(tracker_id)
                 self.entry_positions[tracker_id] = curr_pos
-                # We need to store entry edge for relative calculation
-                # Since we don't store it in a clean struct yet, let's just re-calculate on exit
-                # Or better: let's store it now. 
-                # But to minimize state changes, calculating both on exit (using stored entry pos) is also fine
-                # provided the entry point is close enough to the edge.
-                # Actually, capturing the "closest edge" at the exact moment of entry is safer 
-                # than looking at entry_pos later which might be deeply inside if FPS is low.
-                # Let's add a temporary dict for entry edges.
+                # Store entry edge for relative calculation
                 if not hasattr(self, 'entry_edges'):
                     self.entry_edges = {}
                 
@@ -160,10 +155,12 @@ class TurnDetector:
                         track_id=tracker_id,
                         entry_pos=entry_pos,
                         exit_pos=curr_pos,
-                        direction_deg=direction_deg, # Keeping dummy angle or specific value for logic
+                        direction_deg=direction_deg,
                         turn_type=turn_type,
                         turn_symbol=self.TURN_SYMBOLS.get(turn_type, "?"),
-                        timestamp=timestamp
+                        timestamp=timestamp,
+                        entry_edge=entry_edge,
+                        exit_edge=exit_edge
                     )
                     
                     logger.info(

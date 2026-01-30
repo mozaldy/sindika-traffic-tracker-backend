@@ -43,6 +43,8 @@ class VehicleState:
     # Direction module data
     direction_deg: Optional[float] = None
     direction_symbol: Optional[str] = None
+    entry_edge: Optional[int] = None  # Edge number vehicle entered zone (1-indexed for display)
+    exit_edge: Optional[int] = None   # Edge number vehicle exited zone (1-indexed for display)
     
     # Plate module data
     plate_captured: bool = False

@@ -34,6 +34,17 @@ class TrafficVisualizer:
         "default": (0, 255, 255),    # Yellow
     }
     
+    # Colors by vehicle class name (BGR format)
+    CLASS_COLORS = {
+        "car": (255, 144, 30),       # Dodger Blue
+        "truck": (0, 165, 255),      # Orange
+        "bus": (147, 20, 255),       # Deep Pink
+        "motorcycle": (0, 255, 127), # Spring Green
+        "bicycle": (255, 255, 0),    # Cyan
+        "person": (180, 105, 255),   # Hot Pink
+    }
+    DEFAULT_CLASS_COLOR = (128, 128, 128)  # Gray for unknown classes
+    
     TRAIL_COLOR_COMPLETED = (0, 255, 0)   # Green
     TRAIL_COLOR_IN_ZONE = (255, 0, 0)     # Blue
     TRAIL_COLOR_DEFAULT = (0, 255, 255)   # Yellow
@@ -41,8 +52,33 @@ class TrafficVisualizer:
     
     def __init__(self):
         """Initialize the visualizer with annotation tools."""
-        self.box_annotator = sv.BoxAnnotator()
-        self.label_annotator = sv.LabelAnnotator()
+        # Use ColorLookup.CLASS for per-class coloring
+        self.box_annotator = sv.BoxAnnotator(
+            color=sv.ColorPalette.from_hex([
+                "#1E90FF",  # car - Dodger Blue
+                "#FFA500",  # truck - Orange  
+                "#FF1493",  # bus - Deep Pink
+                "#00FF7F",  # motorcycle - Spring Green
+                "#00FFFF",  # bicycle - Cyan
+                "#FF69B4",  # person - Hot Pink
+                "#9370DB",  # extra - Medium Purple
+                "#20B2AA",  # extra - Light Sea Green
+            ]),
+            color_lookup=sv.ColorLookup.CLASS
+        )
+        self.label_annotator = sv.LabelAnnotator(
+            color=sv.ColorPalette.from_hex([
+                "#1E90FF",  # car
+                "#FFA500",  # truck
+                "#FF1493",  # bus
+                "#00FF7F",  # motorcycle
+                "#00FFFF",  # bicycle
+                "#FF69B4",  # person
+                "#9370DB",  # extra
+                "#20B2AA",  # extra
+            ]),
+            color_lookup=sv.ColorLookup.CLASS
+        )
         self.zones_config: List[Dict[str, Any]] = []  # Store zones for multi-zone rendering
         self.plate_line: Optional[List[float]] = None  # Plate capture line
 
@@ -306,7 +342,7 @@ class TrafficVisualizer:
         speed_estimator: "MultiLaneSpeedEstimator",
         turn_detector: Optional["TurnDetector"] = None
     ) -> list:
-        """Create labels for each detected object."""
+        """Create simple labels for each detected object (name and ID only)."""
         labels = []
         
         if detections.tracker_id is None:
@@ -315,33 +351,6 @@ class TrafficVisualizer:
         for class_id, tid in zip(detections.class_id, detections.tracker_id):
             name = COCO_CLASSES.get(class_id, f"class_{class_id}")
             label = f"#{tid} {name}"
-            
-            # Add speed info if completed
-            if tid in speed_estimator.completed_speeds:
-                result = speed_estimator.completed_speeds[tid]
-                lane_name = result.get('lane_name', '')
-                speed = result.get('speed', 0)
-                symbol = result.get('direction_symbol', '')
-                
-                label += f" {speed:.1f}km/h {symbol}"
-                if lane_name:
-                    label += f" [{lane_name}]"
-            
-            # Show crossing status
-            elif tid in speed_estimator.objects_in_lanes:
-                lane_idx = speed_estimator.objects_in_lanes[tid]
-                if lane_idx < len(speed_estimator.lanes):
-                    lane_name = speed_estimator.lanes[lane_idx].get('name', f'Lane {lane_idx+1}')
-                    label += f" [Crossing {lane_name}]"
-            
-            # Add turn info
-            if turn_detector:
-                turn_res = turn_detector.get_turn_for_vehicle(tid)
-                if turn_res:
-                    label += f" {turn_res.turn_symbol} {turn_res.turn_type.upper()}"
-                elif turn_detector.is_vehicle_in_zone(tid):
-                    label += " [In Zone]"
-            
             labels.append(label)
         
         return labels
